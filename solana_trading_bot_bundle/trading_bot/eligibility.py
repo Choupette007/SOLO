@@ -150,11 +150,12 @@ def _recent_momentum_allowed(
     cfg: Dict[str, Any],
 ) -> Tuple[bool, str]:
     """
-    Enforce minima for short-term momentum.
+    Enforce minima for short-term momentum with fail-closed behavior.
     - Reads price_change_1h and price_change_6h (with fallbacks from dexscreener/birdeye).
     - Config keys (discovery):
         min_price_change_1h  (default: 0.0)  # require >= this percent over 1h
         min_price_change_6h  (default: 0.0)  # require >= this percent over 6h
+    - If a min threshold is explicitly present (> 0) and the corresponding field is missing, fail-closed (return False).
     Returns (allowed, reason)
     """
     try:
@@ -165,24 +166,35 @@ def _recent_momentum_allowed(
         min_1h, min_6h = 0.0, 0.0
 
     # find candidate fields (many APIs use different names)
-    p1 = _num(_best_first(
+    # Use _best_first to detect presence (returns None if all are None/empty)
+    p1_raw = _best_first(
         token.get("price_change_1h"),
         token.get("priceChange1h"),
         (token.get("dexscreener") or {}).get("priceChange1h"),
         (token.get("birdeye") or {}).get("price_change_1h"),
-    ), 0.0)
+    )
 
-    p6 = _num(_best_first(
+    p6_raw = _best_first(
         token.get("price_change_6h"),
         token.get("priceChange6h"),
         (token.get("dexscreener") or {}).get("priceChange6h"),
         (token.get("birdeye") or {}).get("price_change_6h"),
-    ), 0.0)
+    )
 
-    # If config minima are <= 0.0 then no restriction (defaults are 0.0)
-    if min_1h and p1 < float(min_1h):
+    # Fail-closed: if threshold is explicitly set and field is missing, reject
+    if min_1h > 0.0 and p1_raw is None:
+        return False, f"price_change_1h missing but min_price_change_1h={min_1h}% required"
+    if min_6h > 0.0 and p6_raw is None:
+        return False, f"price_change_6h missing but min_price_change_6h={min_6h}% required"
+
+    # Convert to numeric (now safe since we checked presence if threshold exists)
+    p1 = _num(p1_raw, 0.0)
+    p6 = _num(p6_raw, 0.0)
+
+    # Enforce minima if threshold is set
+    if min_1h > 0.0 and p1 < float(min_1h):
         return False, f"price_change_1h={p1}% < min_required={min_1h}%"
-    if min_6h and p6 < float(min_6h):
+    if min_6h > 0.0 and p6 < float(min_6h):
         return False, f"price_change_6h={p6}% < min_required={min_6h}%"
 
     return True, f"recent_momentum_ok 1h={p1}% 6h={p6}%"
@@ -196,16 +208,18 @@ def _price_change_allowed(
     cfg: Dict[str, Any],
 ) -> Tuple[bool, str]:
     """
-    Decide whether a token's 24h price change is acceptable.
+    Decide whether a token's 24h price change is acceptable (signed-aware).
     Returns (allowed: bool, reason: str).
 
     Behavior:
     - Use discovery config values when present (sensible defaults otherwise).
-    - Always reject beyond a hard cap (max_price_change_hard).
-    - Allow pct <= max_price_change unconditionally.
-    - For pct between max_price_change and max_price_change_hard, require market depth:
-        liquidity >= min_liq_for_big_pct OR volume_24h >= min_vol_for_big_pct.
-    - If price is extremely small (< min_price_for_pct), treat pct as unreliable unless market depth present.
+    - For negative price_change_pct (drops): if abs(pct) > max_price_drop, reject; otherwise allow small drops.
+    - For positive pct: 
+        - Always reject beyond a hard cap (max_price_change_hard).
+        - Allow pct <= max_price_change unconditionally.
+        - For pct between max_price_change and max_price_change_hard, require market depth:
+            liquidity >= min_liq_for_big_pct OR volume_24h >= min_vol_for_big_pct.
+        - If price is extremely small (< min_price_for_pct), treat pct as unreliable unless market depth present.
     """
     try:
         disc = cfg.get("discovery") or {}
@@ -214,18 +228,29 @@ def _price_change_allowed(
         min_price_for_pct = _num(disc.get("min_price_for_pct", 0.0001), 0.0001)
         min_liq_for_big_pct = _num(disc.get("min_liq_for_big_pct", 5000.0), 5000.0)
         min_vol_for_big_pct = _num(disc.get("min_vol_for_big_pct", 10000.0), 10000.0)
+        max_price_drop = _num(disc.get("max_price_drop", max_pct), max_pct)  # default to max_price_change if not set
     except Exception:
         max_pct, max_pct_hard, min_price_for_pct, min_liq_for_big_pct, min_vol_for_big_pct = 350.0, 2000.0, 0.0001, 5000.0, 10000.0
+        max_price_drop = max_pct
 
-    apct = abs(float(price_change_pct or 0.0))
+    pct = float(price_change_pct or 0.0)
 
+    # Handle negative price changes (drops)
+    if pct < 0:
+        drop_magnitude = abs(pct)
+        if drop_magnitude > float(max_price_drop):
+            return False, f"price_change_24h={pct}% drop too large (abs>{max_price_drop}%)"
+        # Allow small drops
+        return True, f"price_change_24h={pct}% drop acceptable (abs<={max_price_drop}%)"
+
+    # Positive price change handling (using signed value)
     # Hard safety cap
-    if apct > float(max_pct_hard):
-        return False, f"price_change_24h={apct}% too extreme (>{max_pct_hard}%)"
+    if pct > float(max_pct_hard):
+        return False, f"price_change_24h={pct}% too extreme (>{max_pct_hard}%)"
 
     # Within primary threshold -> allow (these are runners but not absurd)
-    if apct <= float(max_pct):
-        return True, f"price_change_24h={apct}% <= max={max_pct}%"
+    if pct <= float(max_pct):
+        return True, f"price_change_24h={pct}% <= max={max_pct}%"
 
     # Extract market depth
     liq = _num(_best_first(token.get("liquidity"), token.get("liquidity_usd"), 0.0), 0.0)
@@ -240,13 +265,13 @@ def _price_change_allowed(
     if price_val is not None and price_val > 0 and price_val < float(min_price_for_pct):
         if liq >= float(min_liq_for_big_pct) or vol24 >= float(min_vol_for_big_pct):
             return True, f"tiny_price={price_val} but market depth present (liq={liq},vol24={vol24})"
-        return False, f"tiny_price={price_val} -> pct unreliable (apct={apct}%)"
+        return False, f"tiny_price={price_val} -> pct unreliable (pct={pct}%)"
 
     # Percent above max_pct but below hard cap: require depth
     if liq >= float(min_liq_for_big_pct) or vol24 >= float(min_vol_for_big_pct):
-        return True, f"apct={apct}% > {max_pct}% but market depth ok (liq={liq},vol24={vol24})"
+        return True, f"pct={pct}% > {max_pct}% but market depth ok (liq={liq},vol24={vol24})"
 
-    return False, f"price_change_24h={apct}% > {max_pct}% and market depth too low (liq={liq},vol24={vol24})"
+    return False, f"price_change_24h={pct}% > {max_pct}% and market depth too low (liq={liq},vol24={vol24})"
 
 # -----------------------------------------------------------------------------#
 # Centralized HTTP helper (retries for 429/5xx, consistent headers)
