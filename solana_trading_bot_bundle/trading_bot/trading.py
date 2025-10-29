@@ -3815,7 +3815,7 @@ async def real_on_chain_sell(
                     if quote:
                         in_amount = float(quote.get("inAmount", 0))
                         if in_amount > 0:
-                            qty = in_amount / 1_000_000  # Assume 6 decimals
+                            qty = in_amount / (10 ** decimals)
                     
                     price_usd_val = 0.0
                     if current_price and sol_price:
@@ -3855,7 +3855,7 @@ async def real_on_chain_sell(
                     if quote:
                         in_amount = float(quote.get("inAmount", 0))
                         if in_amount > 0:
-                            qty = in_amount / 1_000_000  # Assume 6 decimals
+                            qty = in_amount / (10 ** decimals)
                     
                     price_usd_val = 0.0
                     if current_price and sol_price:
@@ -5108,12 +5108,18 @@ async def main() -> None:
                                                 price_usd_val = 0.0
                                                 fee_usd = 0.0
                                                 
+                                                # Get token decimals for accurate quantity
+                                                token_decimals = 6  # Default fallback
+                                                try:
+                                                    token_decimals = await get_token_decimals(token_addr, solana_client, logger)
+                                                except Exception:
+                                                    pass
+                                                
                                                 # Infer qty from quote
                                                 if quote:
                                                     out_amount = float(quote.get("outAmount", 0))
                                                     if out_amount > 0:
-                                                        # Assume token decimals = 6 (common)
-                                                        qty = out_amount / 1_000_000
+                                                        qty = out_amount / (10 ** token_decimals)
                                                 
                                                 # Convert SOL price to USD
                                                 if buy_price_sol and sol_price:
@@ -5175,12 +5181,18 @@ async def main() -> None:
                                                 price_usd_val = 0.0
                                                 fee_usd = 0.0
                                                 
+                                                # Get token decimals for accurate quantity
+                                                token_decimals = 6  # Default fallback
+                                                try:
+                                                    token_decimals = await get_token_decimals(token_addr, solana_client, logger)
+                                                except Exception:
+                                                    pass
+                                                
                                                 # Infer qty from quote
                                                 if quote:
                                                     out_amount = float(quote.get("outAmount", 0))
                                                     if out_amount > 0:
-                                                        # Assume token decimals = 6 (common)
-                                                        qty = out_amount / 1_000_000
+                                                        qty = out_amount / (10 ** token_decimals)
                                                 
                                                 # Convert SOL price to USD
                                                 if buy_price_sol and sol_price:
