@@ -154,6 +154,38 @@ except Exception:
 # Export alias for external wiring/tests
 make_metrics_store = _make_store if _make_store is not None else None
 
+# --- MetricsStore (new interface for per-fill recording; best-effort import) ---
+MetricsStore = None
+try:
+    from solana_trading_bot_bundle.trading_bot.metrics_engine import MetricsStore  # type: ignore
+    logger.debug("MetricsStore loaded (packaged path).")
+except Exception:
+    try:
+        from .metrics_engine import MetricsStore  # type: ignore
+        logger.debug("MetricsStore loaded (local path).")
+    except Exception:
+        logger.debug("MetricsStore not available; new metrics interface disabled.", exc_info=False)
+        MetricsStore = None
+
+# Module-level metrics store instance (lazy-initialized in main())
+_metrics_store = None
+
+# --- Candlestick patterns (best-effort imports) ---
+try:
+    from patterns import classify_patterns  # type: ignore
+except Exception:
+    classify_patterns = None
+
+try:
+    import candlestick_patterns as csp  # type: ignore
+except Exception:
+    csp = None
+
+try:
+    import volume_utils as vutils  # type: ignore
+except Exception:
+    vutils = None
+
 def _record_metric_fill(
     token_addr: str,
     symbol: str,
@@ -282,6 +314,166 @@ def _record_metric_fill(
         )
     except Exception as e:
         logger.debug("Failed to record metric fill for %s: %s", symbol, e, exc_info=False)
+
+def _metrics_on_fill(
+    token_addr: str,
+    side: str,
+    qty: float,
+    price_usd: float,
+    fee_usd: float = 0.0,
+    dry_run: bool = False,
+    ts: int | None = None
+) -> None:
+    """
+    Safe wrapper to call _metrics_store.on_fill(...) if the store is available.
+    Swallows exceptions to avoid breaking trading logic.
+    
+    Args:
+        token_addr: Token mint address
+        side: "BUY" or "SELL"
+        qty: Quantity traded
+        price_usd: Price per token in USD
+        fee_usd: Fee paid in USD
+        dry_run: True for simulated trades
+        ts: Optional timestamp (defaults to current time)
+    """
+    global _metrics_store
+    if _metrics_store is None:
+        return
+    
+    try:
+        if ts is None:
+            import time
+            ts = int(time.time())
+        
+        _metrics_store.on_fill(
+            ts=ts,
+            token=token_addr,
+            side=side.upper(),
+            qty=qty,
+            price_usd=price_usd,
+            fee_usd=fee_usd,
+            dry_run=dry_run
+        )
+        logger.debug(
+            "MetricsStore.on_fill: %s %s qty=%.6f price_usd=%.6f dry_run=%s",
+            side, token_addr[:8] + "...", qty, price_usd, dry_run
+        )
+    except Exception as e:
+        logger.debug("MetricsStore.on_fill failed for %s: %s", token_addr, e, exc_info=False)
+
+def _attach_patterns_if_available(token: dict) -> None:
+    """
+    Attach candlestick pattern flags to token dict if OHLCV data is available.
+    Looks for _ohlc_df or _ohlc_open/_ohlc_high/_ohlc_low/_ohlc_close/_ohlc_volume arrays.
+    No-op if patterns modules are unavailable or data is missing.
+    
+    Args:
+        token: Token dict (modified in-place)
+    """
+    if classify_patterns is None and csp is None:
+        return
+    
+    try:
+        import pandas as pd
+        
+        # Try to get DataFrame first
+        df = token.get("_ohlc_df")
+        if df is None:
+            # Try to build from arrays
+            o = token.get("_ohlc_open")
+            h = token.get("_ohlc_high")
+            l = token.get("_ohlc_low")
+            c = token.get("_ohlc_close")
+            v = token.get("_ohlc_volume")
+            
+            if all(x is not None and len(x) > 0 for x in [o, h, l, c, v]):
+                df = pd.DataFrame({
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v
+                })
+            else:
+                return
+        
+        if df is None or len(df) < 3:
+            return
+        
+        # Use classify_patterns if available, otherwise use csp detectors
+        if classify_patterns is not None:
+            try:
+                patterns = classify_patterns(df)
+                if isinstance(patterns, dict):
+                    for k, v in patterns.items():
+                        token[f"pattern_{k}"] = v
+                logger.debug("Attached patterns via classify_patterns for %s", token.get("address", "?"))
+            except Exception:
+                pass
+        elif csp is not None:
+            # Use individual pattern detectors from csp
+            try:
+                token["pattern_doji"] = csp.is_doji(df)
+                token["pattern_hammer"] = csp.is_hammer(df)
+                token["pattern_inverted_hammer"] = csp.is_inverted_hammer(df)
+                token["pattern_bullish_engulfing"] = csp.is_bullish_engulfing(df)
+                token["pattern_bearish_engulfing"] = csp.is_bearish_engulfing(df)
+                token["pattern_three_white_soldiers"] = csp.is_three_white_soldiers(df)
+                token["pattern_three_black_crows"] = csp.is_three_black_crows(df)
+                logger.debug("Attached patterns via csp for %s", token.get("address", "?"))
+            except Exception:
+                pass
+                
+    except Exception as e:
+        logger.debug("Pattern attachment failed for %s: %s", token.get("address", "?"), e, exc_info=False)
+
+def _attach_bbands_if_available(token: dict, window: int = 20, stdev: float = 2.0) -> None:
+    """
+    Compute and attach Bollinger Bands if _ohlc_close data is available.
+    Attaches bb_basis, bb_upper, bb_lower, bb_long, bb_short to token dict.
+    No-op if data is missing or insufficient.
+    
+    Args:
+        token: Token dict (modified in-place)
+        window: Rolling window for BB calculation
+        stdev: Standard deviation multiplier for bands
+    """
+    try:
+        import numpy as np
+        
+        # Try to get close prices
+        closes = token.get("_ohlc_close")
+        if closes is None or len(closes) < window:
+            return
+        
+        # Compute Bollinger Bands
+        closes_arr = np.array(closes, dtype=float)
+        
+        # Use last 'window' periods
+        recent = closes_arr[-window:] if len(closes_arr) >= window else closes_arr
+        
+        basis = float(np.mean(recent))
+        std = float(np.std(recent))
+        upper = basis + (stdev * std)
+        lower = basis - (stdev * std)
+        
+        current_price = float(closes_arr[-1])
+        
+        # Attach to token
+        token["bb_basis"] = basis
+        token["bb_upper"] = upper
+        token["bb_lower"] = lower
+        token["bb_long"] = current_price < lower  # Price below lower band = potential long
+        token["bb_short"] = current_price > upper  # Price above upper band = potential short
+        
+        logger.debug(
+            "Attached BBands for %s: basis=%.8f upper=%.8f lower=%.8f long=%s short=%s",
+            token.get("address", "?"), basis, upper, lower, token["bb_long"], token["bb_short"]
+        )
+        
+    except Exception as e:
+        logger.debug("BBands attachment failed for %s: %s", token.get("address", "?"), e, exc_info=False)
 
 # --- Shared helper: derive a unix 'creation' timestamp in *seconds* ----------
 def _derive_creation_ts_s(d: Dict[str, Any]) -> int:
@@ -3121,6 +3313,17 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]]) -> List[D
                         # Fail per-token quietly so enrichment pipeline remains robust
                         continue
 
+        # --- Attach patterns and BBands using new helper functions (best-effort) ---
+        for tok in (enriched or []):
+            try:
+                _attach_patterns_if_available(tok)
+            except Exception:
+                pass
+            try:
+                _attach_bbands_if_available(tok)
+            except Exception:
+                pass
+
         return enriched
 
     except Exception as e:
@@ -3542,6 +3745,15 @@ async def real_on_chain_sell(
         # Mint decimals (use everywhere we compute amounts)
         decimals = await get_token_decimals(token_address, solana_client, logger)
 
+        # Get SOL price for USD conversion in metrics
+        sol_price = None
+        try:
+            sol_price = await get_sol_price(session)
+            if not sol_price or sol_price <= 0:
+                sol_price = price_cache.get("SOLUSD", 1.0)  # Fallback
+        except Exception:
+            sol_price = price_cache.get("SOLUSD", 1.0)  # Fallback
+
         # Per-trade state
         ts = await _get_trade_state(token_address)
         _update_highest(ts, current_price)
@@ -3597,6 +3809,28 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STALE",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000  # Assume 6 decimals
+                    
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=True
+                    )
+                except Exception:
+                    pass
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3615,6 +3849,28 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STALE",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000  # Assume 6 decimals
+                    
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=False
+                    )
+                except Exception:
+                    pass
 
             await mark_token_sold(
                 token_address=token_address,
@@ -3665,6 +3921,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="MAX_HOLD",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=True
+                    )
+                except Exception:
+                    pass
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3683,6 +3959,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="MAX_HOLD",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=False
+                    )
+                except Exception:
+                    pass
 
             await mark_token_sold(
                 token_address=token_address,
@@ -3735,6 +4031,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STOP_LOSS",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=True
+                    )
+                except Exception:
+                    pass
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3753,6 +4069,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STOP_LOSS",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=False
+                    )
+                except Exception:
+                    pass
 
             await mark_token_sold(token_address=token_address, sell_price=float(current_price), sell_txid=str(txid), sell_time=now_ts)
             logger.info(f"[{symbol}] Stop-loss executed. txid={txid}")
@@ -3799,6 +4135,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP1",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=True
+                    )
+                except Exception:
+                    pass
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3817,6 +4173,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP1",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=False
+                    )
+                except Exception:
+                    pass
 
             # Activate trailing & breakeven protection
             ts["tp1_done"] = True
@@ -3868,6 +4244,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP2",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=True
+                    )
+                except Exception:
+                    pass
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3886,6 +4282,26 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP2",
                 )
+                # Call new MetricsStore interface
+                try:
+                    qty = 0.0
+                    if quote:
+                        in_amount = float(quote.get("inAmount", 0))
+                        if in_amount > 0:
+                            qty = in_amount / 1_000_000
+                    price_usd_val = 0.0
+                    if current_price and sol_price:
+                        price_usd_val = current_price * sol_price
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        side="SELL",
+                        qty=qty,
+                        price_usd=price_usd_val,
+                        fee_usd=0.0,
+                        dry_run=False
+                    )
+                except Exception:
+                    pass
 
             ts["tp2_done"] = True
             ts["trail_pct"] = exit_cfg["trail_pct_moonbag"]
@@ -3942,6 +4358,26 @@ async def real_on_chain_sell(
                         source="jupiter",
                         reason="TRAIL",
                     )
+                    # Call new MetricsStore interface
+                    try:
+                        qty = 0.0
+                        if quote:
+                            in_amount = float(quote.get("inAmount", 0))
+                            if in_amount > 0:
+                                qty = in_amount / 1_000_000
+                        price_usd_val = 0.0
+                        if current_price and sol_price:
+                            price_usd_val = current_price * sol_price
+                        _metrics_on_fill(
+                            token_addr=token_address,
+                            side="SELL",
+                            qty=qty,
+                            price_usd=price_usd_val,
+                            fee_usd=0.0,
+                            dry_run=True
+                        )
+                    except Exception:
+                        pass
                 else:
                     txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                     if not txid:
@@ -3960,6 +4396,26 @@ async def real_on_chain_sell(
                         source="jupiter",
                         reason="TRAIL",
                     )
+                    # Call new MetricsStore interface
+                    try:
+                        qty = 0.0
+                        if quote:
+                            in_amount = float(quote.get("inAmount", 0))
+                            if in_amount > 0:
+                                qty = in_amount / 1_000_000
+                        price_usd_val = 0.0
+                        if current_price and sol_price:
+                            price_usd_val = current_price * sol_price
+                        _metrics_on_fill(
+                            token_addr=token_address,
+                            side="SELL",
+                            qty=qty,
+                            price_usd=price_usd_val,
+                            fee_usd=0.0,
+                            dry_run=False
+                        )
+                    except Exception:
+                        pass
 
                 await mark_token_sold(token_address=token_address, sell_price=float(current_price), sell_txid=str(txid), sell_time=now_ts)
                 logger.info(f"[{symbol}] Trailing stop exit complete. txid={txid}")
@@ -4108,6 +4564,20 @@ async def main() -> None:
         # --- NOW load config and init logging BEFORE using `config` anywhere ---
         config = load_config()
         setup_logging(config)
+
+        # --- Initialize MetricsStore (lazy, best-effort) ---
+        global _metrics_store
+        try:
+            if MetricsStore is not None:
+                mcfg = ((config or {}).get("metrics") or {})
+                _metrics_store = MetricsStore(
+                    replay_on_init=True,
+                    prorate_fees=bool(mcfg.get("prorate_fees", False))
+                )
+                logger.info("MetricsStore initialized (prorate_fees=%s)", mcfg.get("prorate_fees", False))
+        except Exception as e:
+            logger.debug("MetricsStore initialization failed: %s", e, exc_info=False)
+            _metrics_store = None
 
         # --- Testing override: loosen selection thresholds so shortlist doesn't collapse ---
         TEST_LOOSEN = bool(int(os.getenv("TEST_LOOSEN_SELECTION", "0")))
@@ -4271,6 +4741,13 @@ async def main() -> None:
                                 t.setdefault("_enriched", False)
                         try:
                             await persist_eligible_shortlist(eligible_tokens, prune_hours=168)
+                            # Take equity snapshot after shortlist refresh
+                            try:
+                                if _metrics_store is not None:
+                                    _metrics_store.snapshot_equity_point()
+                                    logger.debug("MetricsStore equity snapshot after shortlist refresh")
+                            except Exception:
+                                pass
                         except Exception:
                             logger.debug("Persisting shortlist (DB path refresh) failed", exc_info=True)
                     else:
@@ -4625,6 +5102,33 @@ async def main() -> None:
                                                 simulated=True,
                                                 source=source,
                                             )
+                                            # Call new MetricsStore interface
+                                            try:
+                                                qty = 0.0
+                                                price_usd_val = 0.0
+                                                fee_usd = 0.0
+                                                
+                                                # Infer qty from quote
+                                                if quote:
+                                                    out_amount = float(quote.get("outAmount", 0))
+                                                    if out_amount > 0:
+                                                        # Assume token decimals = 6 (common)
+                                                        qty = out_amount / 1_000_000
+                                                
+                                                # Convert SOL price to USD
+                                                if buy_price_sol and sol_price:
+                                                    price_usd_val = buy_price_sol * sol_price
+                                                
+                                                _metrics_on_fill(
+                                                    token_addr=token_addr,
+                                                    side="BUY",
+                                                    qty=qty,
+                                                    price_usd=price_usd_val,
+                                                    fee_usd=fee_usd,
+                                                    dry_run=True
+                                                )
+                                            except Exception:
+                                                pass
                                             continue
 
                                         try:
@@ -4665,6 +5169,33 @@ async def main() -> None:
                                                 simulated=False,
                                                 source=source,
                                             )
+                                            # Call new MetricsStore interface
+                                            try:
+                                                qty = 0.0
+                                                price_usd_val = 0.0
+                                                fee_usd = 0.0
+                                                
+                                                # Infer qty from quote
+                                                if quote:
+                                                    out_amount = float(quote.get("outAmount", 0))
+                                                    if out_amount > 0:
+                                                        # Assume token decimals = 6 (common)
+                                                        qty = out_amount / 1_000_000
+                                                
+                                                # Convert SOL price to USD
+                                                if buy_price_sol and sol_price:
+                                                    price_usd_val = buy_price_sol * sol_price
+                                                
+                                                _metrics_on_fill(
+                                                    token_addr=token_addr,
+                                                    side="BUY",
+                                                    qty=qty,
+                                                    price_usd=price_usd_val,
+                                                    fee_usd=fee_usd,
+                                                    dry_run=False
+                                                )
+                                            except Exception:
+                                                pass
                                         except Exception as e:
                                             logger.error(
                                                 "Jupiter execute failed for %s (%s): %s",
@@ -4726,6 +5257,14 @@ async def main() -> None:
                             await asyncio.sleep(0.5)
 
                     # ---- end-of-cycle ----
+                    # Take equity snapshot for metrics tracking
+                    try:
+                        if _metrics_store is not None:
+                            _metrics_store.snapshot_equity_point()
+                            logger.debug("MetricsStore equity snapshot taken")
+                    except Exception:
+                        pass
+                    
                     interval = int(float((config.get("bot") or {}).get("cycle_interval", 30)))
                     logger.info("Completed trading cycle, waiting %d seconds", interval)
                     _heartbeat()
