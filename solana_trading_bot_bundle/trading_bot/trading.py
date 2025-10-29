@@ -29,6 +29,9 @@ def _new_async_client(rpc_url: str):
     """
     Return a new AsyncClient. If the import was deferred/hidden, do a late import
     so runtime still succeeds.
+    
+    NOTE: This is the canonical implementation. A duplicate definition that appeared
+    later in the file (around line ~397) has been removed to avoid overshadowing.
     """
     if AsyncClient is None:  # type: ignore[name-defined]
         from solana.rpc.async_api import AsyncClient as _AC  # type: ignore[reportMissingImports]
@@ -387,22 +390,6 @@ try:
 except Exception:
     COMMIT_CONFIRMED = None
     COMMIT_PROCESSED = None
-
-try:
-    # Pylance sometimes flags this even when it exists at runtime; ignore its warning.
-    from solana.rpc.async_api import AsyncClient  # type: ignore[reportMissingImports]
-except Exception:  # pragma: no cover
-    AsyncClient = None  # type: ignore[misc, assignment]
-
-def _new_async_client(rpc_url: str):
-    """
-    Return a new AsyncClient. If Pylance (or an edge environment) hid the import,
-    do a late import so runtime still succeeds.
-    """
-    if AsyncClient is None:  # type: ignore[name-defined]
-        from solana.rpc.async_api import AsyncClient as _AC  # type: ignore[reportMissingImports]
-        return _AC(rpc_url)
-    return AsyncClient(rpc_url)  # type: ignore[call-arg]
 
 # ---- Core constants / paths
 from solana_trading_bot_bundle.common.constants import (
@@ -1616,8 +1603,6 @@ from .database import (
     get_open_positions,
     get_token_trade_status,
 )
-
-logger = logging.getLogger("TradingBot")
 
 # --- Build+trim+enrich live shortlist once -----------------------------------
 async def _fetch_live_shortlist_once(
@@ -4698,7 +4683,7 @@ async def main() -> None:
 
                     if cycle_index % 5 == 0:
                         try:
-                            await _log_positions_snapshot(open_positions, session, config)
+                            await _log_positions_snapshot(open_positions, session, solana_client, config)
                         except Exception:
                             logger.debug("positions snapshot failed", exc_info=True)
 
