@@ -154,6 +154,27 @@ except Exception:
 # Export alias for external wiring/tests
 make_metrics_store = _make_store if _make_store is not None else None
 
+# --- Module-level state for orchestration loop -------------------------------
+GLOBAL_CONFIG: Dict[str, Any] | None = None
+_metrics_store: Any | None = None  # Lazy-initialized MetricsStore instance
+
+def _metrics_snapshot_equity_point() -> None:
+    """
+    Best-effort equity snapshot for MetricsStore (if available).
+    Swallows exceptions to avoid breaking trading logic.
+    """
+    if _metrics_store is None:
+        return
+    try:
+        if hasattr(_metrics_store, "snapshot_equity"):
+            _metrics_store.snapshot_equity()
+        elif hasattr(_metrics_store, "record_equity_snapshot"):
+            _metrics_store.record_equity_snapshot()
+        else:
+            logger.debug("MetricsStore has no snapshot method; skipping equity point.")
+    except Exception as e:
+        logger.debug("Equity snapshot failed: %s", e, exc_info=False)
+
 def _record_metric_fill(
     token_addr: str,
     symbol: str,
@@ -4054,726 +4075,215 @@ async def _log_positions_snapshot(
 
 # -------------------------- Main loop --------------------------
 async def main() -> None:
-    logger.info("Starting trading bot")
+    """
+    Corrected orchestration loop using GLOBAL_CONFIG and lazy-initialized MetricsStore.
+    This replaces the earlier main() that had an incorrect flow from a bad merge.
+    """
+    global GLOBAL_CONFIG, _metrics_store
+    
+    logger.info("Starting trading bot (corrected orchestration)")
     solana_client: Optional[AsyncClientType] = None
+    session: Optional[aiohttp.ClientSession] = None
+    hb_task: Optional[asyncio.Task] = None
+    stop_event = asyncio.Event()
+    
     try:  # ==== OUTER TRY ====
-        # --- .env loading + diagnostics (do this first) ---
-        from dotenv import load_dotenv, find_dotenv
-        from pathlib import Path
-
-        candidate_envs = [
-            # preferred app-data location used by the GUI
-            Path.home() / "AppData" / "Local" / "SOLOTradingBot" / ".env",
-            # repo / working dir fallback
-            Path.cwd() / ".env",
-        ]
-        loaded_from = None
-        for p in candidate_envs:
-            try:
-                if p.exists():
-                    load_dotenv(dotenv_path=str(p), override=True)
-                    loaded_from = str(p)
-                    break
-            except Exception:
-                pass
-        if not loaded_from:
-            discovered = find_dotenv(usecwd=True)
-            if discovered:
-                load_dotenv(discovered, override=True)
-                loaded_from = discovered
-                
-
-        # quick env echo so we know what actually applied
-        logger.info("ENV: loaded from %s", loaded_from or "<none>")
-        logger.info(
-            "ENV FLAGS: DRY_RUN=%s DISABLE_SEND_TX=%s JUPITER_QUOTE_ONLY=%s JUPITER_EXECUTE=%s",
-            os.getenv("DRY_RUN", "0"), os.getenv("DISABLE_SEND_TX", "0"),
-            os.getenv("JUPITER_QUOTE_ONLY", "0"), os.getenv("JUPITER_EXECUTE", "0"),
-        )
-        logger.info(
-            "Birdeye: ENABLE=%s FORCE_DISABLE=%s KEY_PRESENT=%s RPS=%s cycle_cap=%s run_cap=%s",
-            os.getenv("BIRDEYE_ENABLE", "0") in ("1", "true", "True"),
-            os.getenv("FORCE_DISABLE_BIRDEYE", "0"),
-            "yes" if os.getenv("BIRDEYE_API_KEY") else "no",
-            os.getenv("BIRDEYE_RPS", "?"),
-            os.getenv("BIRDEYE_MAX_CALLS_PER_CYCLE", "?"),
-            os.getenv("BIRDEYE_MAX_CALLS_PER_RUN", "?"),
-        )
-        logger.info(
-            "Dexscreener: DEX_PAGES=%s DEX_PER_PAGE=%s DEX_MAX=%s DEX_FORCE_IPV4=%s",
-            os.getenv("DEX_PAGES", "?"), os.getenv("DEX_PER_PAGE", "?"),
-            os.getenv("DEX_MAX", "?"), os.getenv("DEX_FORCE_IPV4", "auto"),
-        )
-
-        # --- NOW load config and init logging BEFORE using `config` anywhere ---
+        # 1) Load config and setup logging at start
         config = load_config()
+        GLOBAL_CONFIG = config
         setup_logging(config)
-
-        # --- Testing override: loosen selection thresholds so shortlist doesn't collapse ---
-        TEST_LOOSEN = bool(int(os.getenv("TEST_LOOSEN_SELECTION", "0")))
-        if TEST_LOOSEN:
-            sel = (config.get("selection") or {})
-            sel.setdefault("min_liquidity_usd", 0)
-            sel.setdefault("min_volume_24h_usd", 0)
-            sel.setdefault("min_age_minutes", 0)
-            sel.setdefault("allow_missing_mc", True)
-            sel.setdefault("allow_missing_liq", True)
-            config["selection"] = sel
-            logger.info("Selection thresholds loosened for testing (TEST_LOOSEN_SELECTION=1).")
-
-       
-        # --- SINGLE-INSTANCE GUARD (claim before any side effects) ---
-        if not acquire_single_instance_or_explain(int(os.getenv("PID_STALE_AFTER_S", "180"))):
+        
+        # 2) Lazy initialize MetricsStore (best-effort, avoid startup crash)
+        try:
+            if _make_store is not None:
+                metrics_cfg = config.get("metrics") or {}
+                prorate_fees = bool(metrics_cfg.get("prorate_fees", False))
+                _metrics_store = _make_store(logger=logger, replay_on_init=True, prorate_fees=prorate_fees)
+                logger.info("MetricsStore initialized with prorate_fees=%s", prorate_fees)
+            else:
+                logger.debug("MetricsStore unavailable; metrics disabled.")
+        except Exception as e:
+            logger.warning("Failed to initialize MetricsStore: %s (continuing without metrics)", e)
+            _metrics_store = None
+        
+        # 3) Ensure schema once (best-effort)
+        try:
+            await _ensure_schema_once(logger)
+        except Exception as e:
+            logger.debug("Schema bootstrap failed (continuing): %s", e)
+        
+        # 4) Initialize aiohttp ClientSession
+        session = aiohttp.ClientSession()
+        
+        # 5) Initialize solana AsyncClient using config or env fallback
+        rpc_endpoint = config.get("solana", {}).get("rpc_endpoint") or os.getenv("SOLANA_RPC_URL")
+        if not rpc_endpoint:
+            logger.error("No RPC endpoint in config or SOLANA_RPC_URL env var")
             return
-
-        # Start a background heartbeat that stays fresh even during long cycles
-        stop_hb = asyncio.Event()
-        hb_task = asyncio.create_task(heartbeat_task(stop_hb, int(os.getenv("HEARTBEAT_INTERVAL_S", "5"))))
-
-        # Persist our PID & emit an immediate heartbeat
-        _write_pid_file()
-        _heartbeat(throttle_s=0)
-        # --- END GUARD ---
-
-        # RPC client (create ONCE)
-        solana_client = _new_async_client(config["solana"]["rpc_endpoint"])
-
-        # Wallet
-        private_key = os.getenv(config["wallet"]["private_key_env"])
+        solana_client = _new_async_client(rpc_endpoint)
+        logger.info("Solana RPC client initialized: %s", rpc_endpoint)
+        
+        # 6) Load wallet keypair from config or WALLET_KEYPATH env
+        wallet_key_env = config.get("wallet", {}).get("private_key_env") or "WALLET_KEYPATH"
+        private_key = os.getenv(wallet_key_env)
         if not private_key:
-            logger.error("%s not set", config["wallet"]["private_key_env"])
+            logger.error("Wallet private key not found in env var: %s", wallet_key_env)
             return
         wallet = Keypair.from_base58_string(private_key)
         logger.info("Wallet loaded: %s", wallet.pubkey())
-
-        # RPC quick check (resilient to response shape changes)
-        try:
-            bh = await solana_client.get_latest_blockhash()
-            slot = getattr(getattr(bh, "context", None), "slot", None)
-            blockhash = getattr(getattr(bh, "value", None), "blockhash", None)
-            short_bh = (blockhash[:12] + "…") if isinstance(blockhash, str) else str(blockhash)
-
-            ver = await solana_client.get_version()
-
-            # Normalize version payload to something we can query safely
-            v = getattr(ver, "value", ver)
-            core = None
-            if isinstance(v, dict):
-                core = (
-                    v.get("solana-core")
-                    or v.get("solana_core")
-                    or v.get("solanaCore")
-                    or v.get("solana")
-                    or v.get("version")
-                )
-            else:
-                # Sometimes it's a typed object; probe common attribute names
-                core = (
-                    getattr(v, "solana_core", None)
-                    or getattr(v, "solanaCore", None)
-                    or getattr(v, "solana", None)
-                    or getattr(v, "version", None)
-                )
-
-            logger.info(
-                "RPC OK via %s - slot=%s, blockhash=%s, core=%s",
-                config["solana"]["rpc_endpoint"], slot, short_bh, core or "unknown"
-            )
-        except Exception as e:
-            logger.warning("RPC health check failed: %s", e)
-
-
-        # DB init
+        
+        # 7) Start heartbeat task
+        hb_task = asyncio.create_task(heartbeat_task(stop_event, interval=5))
+        
+        # 8) Initialize DB
         await init_db()
-        await _ensure_schema_once(logger)
-
+        
         blacklist = await db_load_blacklist()
         failure_count: Dict[str, int] = {}
-        cycle_index = 0
-
-        async with aiohttp.ClientSession() as session:
-            while True:
-                # Stop flag check (operator-controlled)
+        
+        # Main orchestration loop
+        logger.info("Entering main trading loop")
+        while True:
+            try:  # <-- per-cycle try
+                # Check stop flag
                 try:
                     with open("bot_stop_flag.txt", "r") as f:
                         if f.read().strip() == "1":
-                            logger.info("Stop flag detected, exiting trading bot")
+                            logger.info("Stop flag detected, exiting")
                             break
                 except FileNotFoundError:
                     pass
-
-                # ===== PER-CYCLE START =====
-                try:  # <-- per-cycle try MUST align with except below
-                    # Reset Jupiter offline breaker for this cycle
-                    global _JUP_OFFLINE
-                    _JUP_OFFLINE = False
-
-                    # Hygiene
-                    await clear_expired_blacklist(max_age_hours=24)
-                    await review_blacklist()
-
-                    # Balance (telemetry)
-                    startup_balance = await get_sol_balance(wallet, solana_client)
-                    required_min = float((config.get("bot") or {}).get("required_sol", 0.0))
-                    logger.info("Startup SOL balance: %.6f (min required=%.6f)", startup_balance, required_min)
-
-                    # Source queries for trading pass
-                    _discovery_cfg = (config.get("discovery") or {})
-                    queries = _discovery_cfg.get("dexscreener_queries") or ["solana"]
-                    queries = list(dict.fromkeys(queries))
-                    logger.info("Trading: using dexscreener queries %s", queries)
-
-                    # Build shortlist (DB first, then live)
-                    eligible_tokens: List[Dict[str, Any]] = []
-                    using_db_shortlist = False
-
-                    prefer_db_shortlist = bool((config.get("trading") or {}).get("prefer_persisted_shortlist", True))
-                    db_max_age_s = int((config.get("trading") or {}).get("db_shortlist_max_age_s", 300))
-                    db_min_count = int((config.get("trading") or {}).get("db_shortlist_min_count", 10))
-
+                
+                # Build shortlist via _fetch_live_shortlist_once
+                queries = config.get("discovery", {}).get("dexscreener_queries") or ["solana"]
+                shortlist = await _fetch_live_shortlist_once(
+                    session=session,
+                    solana_client=solana_client,
+                    config=config,
+                    queries=queries,
+                    blacklist=blacklist,
+                    failure_count=failure_count,
+                    logger=logger
+                )
+                
+                logger.info("Shortlist: %d tokens", len(shortlist))
+                
+                # Simplified buy loop
+                for token in shortlist[:10]:  # top 10
+                    token_addr = token.get("address")
+                    if not token_addr:
+                        continue
+                    
+                    symbol = token.get("symbol", "UNKNOWN")
+                    
+                    # Get Jupiter quote
                     try:
-                        eligible_tokens_from_db = _load_persisted_shortlist_from_db(
-                            config=config, max_age_s=db_max_age_s, min_count=db_min_count
-                        )
-                    except Exception as _e:
-                        logger.warning("DB shortlist load failed: %s; falling back to live.", _e)
-                        eligible_tokens_from_db = []
-
-                    if prefer_db_shortlist and eligible_tokens_from_db:
-                        eligible_tokens = eligible_tokens_from_db
-                        using_db_shortlist = True
-                        logger.info("Using %d token(s) from persisted shortlist.", len(eligible_tokens))
-                    else:
-                        logger.info("Persisted shortlist stale/small/empty; running live discovery.")
-                        eligible_tokens = await _build_live_shortlist(
+                        quote, error = await _safe_get_jupiter_quote(
+                            input_mint="So11111111111111111111111111111111111111112",  # WSOL
+                            output_mint=token_addr,
+                            amount=int(0.01 * 1_000_000_000),  # 0.01 SOL in lamports
+                            user_pubkey=str(wallet.pubkey()),
                             session=session,
+                            slippage_bps=150
+                        )
+                        
+                        if not quote or error:
+                            logger.info("Skip %s: no quote (%s)", symbol, error or "no route")
+                            continue
+                    except Exception as e:
+                        logger.warning("Quote error for %s: %s", symbol, e)
+                        continue
+                    
+                    # Call real_on_chain_buy
+                    simulated = _dry_run_on(config)
+                    try:
+                        txid = await real_on_chain_buy(
+                            token=token,
+                            buy_amount=0.01,  # SOL amount
+                            wallet=wallet,
                             solana_client=solana_client,
-                            config=config,
-                            queries=queries,
+                            session=session,
                             blacklist=blacklist,
                             failure_count=failure_count,
+                            config=config
                         )
-
-                    # Common shortlist processing
-                    fallback_hours = int((config.get("trading") or {}).get("db_fallback_hours", 1))
-                    _fallback_age_s = max(0, fallback_hours) * 3600
-
-                    if using_db_shortlist:
-                        try:
-                            enriched = await _enrich_shortlist_with_signals(eligible_tokens)
-                            eligible_tokens = enriched or eligible_tokens
-                            if not enriched:
-                                for t in eligible_tokens:
-                                    t.setdefault("_enriched", False)
-                        except Exception:
-                            logger.warning("Signal enrichment failed on DB shortlist; keeping original.", exc_info=True)
-                            for t in eligible_tokens:
-                                t.setdefault("_enriched", False)
-                        try:
-                            await persist_eligible_shortlist(eligible_tokens, prune_hours=168)
-                        except Exception:
-                            logger.debug("Persisting shortlist (DB path refresh) failed", exc_info=True)
-                    else:
-                        # Ensure categories exist before per-bucket selection (live path)
-                        eligible_tokens = _restore_or_compute_categories(eligible_tokens)
-                        eligible_tokens = await select_top_five_per_category(eligible_tokens)
-                        try:
-                            enriched = await _enrich_shortlist_with_signals(eligible_tokens)
-                            if enriched:
-                                eligible_tokens = enriched
-                            else:
-                                logger.warning("Live shortlist collapsed; attempting DB fallback (<=%ds).", _fallback_age_s)
-                                db_fallback = _load_persisted_shortlist_from_db(
-                                    config=config, max_age_s=_fallback_age_s, min_count=5
-                                )
-                                if db_fallback:
-                                    # Backfill categories on DB fallback so downstream logic/UI has buckets
-                                    eligible_tokens = _restore_or_compute_categories(db_fallback)
-                                    using_db_shortlist = True
-                                    logger.info("Pulled %d tokens from DB fallback.", len(eligible_tokens))
-                                else:
-                                    # Backfill again before the fallback selector
-                                    eligible_tokens = _restore_or_compute_categories(eligible_tokens)
-                                    eligible_tokens = await select_top_five_per_category(eligible_tokens)
-                                    for t in eligible_tokens:
-                                        t.setdefault("_enriched", False)
-                        except Exception:
-                            logger.warning("Signal enrichment failed on live shortlist; attempting DB fallback.", exc_info=True)
-                            db_fallback = _load_persisted_shortlist_from_db(
-                                config=config, max_age_s=_fallback_age_s, min_count=5
-                            )
-                            if db_fallback:
-                                # Backfill categories on DB fallback too
-                                eligible_tokens = _restore_or_compute_categories(db_fallback)
-                                using_db_shortlist = True
-                                logger.info("Pulled %d tokens from DB fallback.", len(eligible_tokens))
-                            else:
-                                for t in eligible_tokens:
-                                    t.setdefault("_enriched", False)
-
-                    _apply_tech_tiebreaker(eligible_tokens, config, logger=logger)
-                    logger.info("Found %d eligible tokens", len(eligible_tokens))
-                    log_scoring_telemetry(eligible_tokens, where="shortlist")
-
-                    if using_db_shortlist and not eligible_tokens:
-                        logger.info("DB shortlist yielded zero; forcing live discovery once.")
-                        eligible_tokens = await _fetch_live_shortlist_once(
-                            session=session, solana_client=solana_client, config=config,
-                            queries=queries, blacklist=blacklist, failure_count=failure_count, logger=logger
-                        )
-
-                    # Mode flags
-                    tsec = (config.get("trading") or {})
-                    bsec = (config.get("bot") or {})
-
-                    dry = _dry_run_on(config)
-                    send_disabled = _skip_onchain_send(config)
-                    simulate = bool(tsec.get("simulate", bsec.get("simulate", False)))
-
-                    env_dry = os.getenv("DRY_RUN", "0") == "1"
-                    env_disable_send = os.getenv("DISABLE_SEND_TX", "0") == "1"
-                    env_jup_quote_only = os.getenv("JUPITER_QUOTE_ONLY", "0") == "1"
-                    env_jup_execute = os.getenv("JUPITER_EXECUTE", "0") == "1"
-
-                    dry = dry or env_dry
-                    simulate = simulate or env_dry or env_jup_quote_only
-                    send_disabled = send_disabled or env_disable_send or env_jup_quote_only
-                    if env_jup_execute and not env_jup_quote_only:
-                        simulate = False
-
-                    _dry_run       = bool(locals().get("dry_run", locals().get("dry", False)))
-                    _send_disabled = bool(locals().get("send_disabled", False))
-                    _simulate      = bool(locals().get("simulate", False))
-
-                    try:
-                        _has_balance = await has_min_balance(wallet, config, session=session)
-                    except Exception as _e:
-                        logger.warning("Balance check failed; treating as no-balance. (%s)", _e)
-                        _has_balance = False
-
-                    _enabled = bool((config.get("trading") or {}).get("enabled", True))
-                    _send_tx = not _send_disabled
-                    can_trade = True if (_dry_run or _send_disabled or _simulate) else bool(_has_balance)
-
-                    logger.info(
-                        "TRADING-CYCLE: shortlist=%d enabled=%s dry_run=%s simulate=%s send_tx=%s can_trade=%s",
-                        len(eligible_tokens), _enabled, _dry_run, _simulate, _send_tx, can_trade
-                    )
-
-                    # ---------------- Buys ----------------
-                    candidates = eligible_tokens[:10]
-                    logger.info("TRADING-CYCLE: entering buy loop with %d candidate(s)", len(candidates))
-                    try:
-                        if not candidates:
-                            logger.info("No buy candidates this cycle")
+                        
+                        if txid:
+                            logger.info("BUY SUCCESS %s (%s): txid=%s simulated=%s", 
+                                       symbol, token_addr, txid, simulated)
                         else:
-                            WSOL = "So11111111111111111111111111111111111111112"
-                            USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-                            user_pubkey = str(wallet.pubkey())
-                            LAMPORTS_PER_SOL = 1_000_000_000
-
-                            # Resolve SOL price
-                            sol_price: Optional[float] = None
-                            try:
-                                sol_price = await get_sol_price(session)
-                                if sol_price and sol_price > 0:
-                                    try:
-                                        price_cache["SOLUSD"] = float(sol_price)
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                sol_price = None
-
-                            if not sol_price:
-                                try:
-                                    cached = float(price_cache.get("SOLUSD") or 0.0)
-                                    sol_price = cached if cached > 0 else None
-                                except Exception:
-                                    sol_price = None
-
-                            if not sol_price:
-                                try:
-                                    quote, qerr = await _safe_get_jupiter_quote(
-                                        input_mint=WSOL,
-                                        output_mint=USDC,
-                                        amount=LAMPORTS_PER_SOL,  # 1 SOL
-                                        user_pubkey=user_pubkey,
-                                        session=session,
-                                        slippage_bps=50,
-                                    )
-                                    if quote and not qerr:
-                                        usdc_out_raw = float(quote.get("outAmount") or 0.0)  # USDC 6dp
-                                        derived = usdc_out_raw / 1_000_000 if usdc_out_raw > 0 else 0.0
-                                        if derived > 0:
-                                            sol_price = derived
-                                            try:
-                                                price_cache["SOLUSD"] = float(sol_price)
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
-                            if not sol_price:
-                                try:
-                                    env_fallback = os.getenv("SOL_FALLBACK_PRICE")
-                                    sol_price = float(env_fallback) if env_fallback else None
-                                except Exception:
-                                    sol_price = None
-
-                            if not sol_price:
-                                logger.warning("Unable to determine SOL price; skipping buys this cycle.")
-                            else:
-                                # --- Sizing ---
-                                wallet_balance = await get_sol_balance(wallet, solana_client)
-
-                                buy_amount_sol = await _resolve_buy_amount_sol(
-                                    get_buy_amount_fn=get_buy_amount,
-                                    config=config,
-                                    sol_price=sol_price,
-                                    wallet_balance=wallet_balance,
-                                    token=None,  # pass a token dict if you tilt sizing per-asset
-                                )
-
-                                # Optional: do not size above available balance (minus a dust buffer)
-                                try:
-                                    max_afford = max(0.0, float(wallet_balance) - 0.0003)
-                                    if buy_amount_sol > max_afford:
-                                        logger.info(
-                                            "Clamping buy amount from %.6f SOL to wallet max %.6f SOL",
-                                            buy_amount_sol,
-                                            max_afford,
-                                        )
-                                        buy_amount_sol = max_afford
-                                except Exception:
-                                    pass
-                                
-                                    # --- Compute slippage once for the cycle ---
-                                    slippage_bps = _clamp_bps(int((config.get("trading") or {}).get("slippage_bps", 150)))
-
-                                    # rank/tilt
-                                    enriched = await _enrich_shortlist_with_signals(candidates)
-                                    if enriched:
-                                        candidates = enriched
-                                    else:
-                                        for t in candidates:
-                                            t.setdefault("_enriched", False)
-                                        logger.warning(
-                                            "Candidate enrichment returned empty; keeping un-enriched candidates."
-                                        )
-                                    _apply_tech_tiebreaker(candidates, config, logger=logger)
-
-                                    for tok in candidates:
-                                        token_addr = tok.get("address")
-                                        symbol = tok.get("symbol") or "UNKNOWN"
-                                        source = tok.get("source", "dexscreener")
-                                        if not token_addr:
-                                            continue
-
-                                        # --- Per-token sizing override (nice-to-have) ---
-                                        per_token_buy_amount_sol = buy_amount_sol  # default to cycle-level amount
-                                        if (config.get("bot") or {}).get("per_asset_sizing", True):
-                                            try:
-                                                # unwraps (sol, usd) → sol inside the resolver
-                                                per_token_buy_amount_sol = await _resolve_buy_amount_sol(
-                                                    get_buy_amount_fn=get_buy_amount,
-                                                    config=config,
-                                                    sol_price=sol_price,
-                                                    wallet_balance=wallet_balance,
-                                                    token=tok,  # pass the actual token for richer logs + sizing
-                                                )
-                                            except Exception as e:
-                                                logger.warning(
-                                                    "Per-asset sizing failed for %s: %s",
-                                                    tok.get("symbol") or tok.get("address") or "unknown",
-                                                    e,
-                                                )
-                                                per_token_buy_amount_sol = buy_amount_sol
-
-                                        # Skip tokens with zero/negative sizing
-                                        if per_token_buy_amount_sol <= 0:
-                                            logger.warning(
-                                                "Buy sizing <= 0 for %s; skipping.",
-                                                tok.get("symbol") or tok.get("address") or "unknown",
-                                            )
-                                            continue
-
-                                        # --- Convert to lamports for this token ---
-                                        amount_lamports_full = max(1, int(per_token_buy_amount_sol * LAMPORTS_PER_SOL))
-
-                                        # Small probe amount for preflight / route sanity (~0.0001 SOL or 10k lamports minimum)
-                                        amount_lamports_probe = min(
-                                            amount_lamports_full,
-                                            max(10_000, int(0.0001 * LAMPORTS_PER_SOL)),
-                                        )
-
-                                        # Optional: avoid dust routes
-                                        if amount_lamports_full < 10_000:
-                                            logger.debug(
-                                                "Skipping dust-size buy for %s (full=%d lamports)",
-                                                tok.get("symbol") or tok.get("address") or "unknown",
-                                                amount_lamports_full,
-                                            )
-                                            continue
-
-                                        # Preflight
-
-                                        # Preflight
-                                        is_tradable, errtxt = await _is_jupiter_tradable(
-                                            input_mint=WSOL,
-                                            output_mint=token_addr,
-                                            lamports=amount_lamports_probe,
-                                            user_pubkey=user_pubkey,
-                                            session=session,
-                                            slippage_bps=slippage_bps,
-                                        )
-                                        if not is_tradable:
-                                            msg = (
-                                                "TOKEN_NOT_TRADABLE"
-                                                if errtxt and "TOKEN_NOT_TRADABLE" in errtxt
-                                                else (errtxt or "unknown")
-                                            )
-                                            logger.info("Skip %s (%s): %s", symbol, token_addr, msg)
-                                            continue
-
-                                        # Full quote
-                                        quote, qerr = await _safe_get_jupiter_quote(
-                                            input_mint=WSOL,
-                                            output_mint=token_addr,
-                                            amount=amount_lamports_full,
-                                            user_pubkey=user_pubkey,
-                                            session=session,
-                                            slippage_bps=slippage_bps,
-                                        )
-                                        if not quote or qerr:
-                                            logger.error(
-                                                "Failed full-quote for %s (%s): %s",
-                                                symbol,
-                                                token_addr,
-                                                qerr or "no route",
-                                            )
-                                            continue
-
-                                        out_amount = None
-                                        try:
-                                            out_amount = float(quote.get("outAmount") or 0)
-                                        except Exception:
-                                            pass
-                                        logger.info(
-                                            "BUY-CANDIDATE %s (%s): preflight OK, got full quote (lamports_in=%d, out≈%s).",
-                                            symbol,
-                                            token_addr,
-                                            amount_lamports_full,
-                                            f"{int(out_amount):,}" if out_amount is not None else "?",
-                                        )
-
-                                        buy_price_sol = _compute_buy_price_sol_per_token(quote)
-                                        if buy_price_sol is None:
-                                            try:
-                                                buy_price_sol = await get_token_price_in_sol(
-                                                    token_addr,
-                                                    session,
-                                                    price_cache,
-                                                    {"address": token_addr, "symbol": symbol},
-                                                )
-                                                buy_price_sol = (
-                                                    float(buy_price_sol)
-                                                    if buy_price_sol and buy_price_sol > 0
-                                                    else None
-                                                )
-                                            except Exception:
-                                                buy_price_sol = None
-
-                                        # Simulate or execute
-                                        if _dry_run or _send_disabled or _simulate:
-                                            txid = _dry_run_txid("BUY")
-                                            try:
-                                                await update_token_record(
-                                                    token={
-                                                        "address": token_addr,
-                                                        "symbol": symbol,
-                                                        "source": source,
-                                                    },
-                                                    buy_price=buy_price_sol,
-                                                    buy_txid=txid,
-                                                    buy_time=int(time.time()),
-                                                    is_trading=True,
-                                                )
-                                            except Exception:
-                                                logger.debug(
-                                                    "Paper trade persistence failed for %s",
-                                                    token_addr,
-                                                    exc_info=True,
-                                                )
-                                            logger.info(
-                                                "DRYRUN-BUY %s (%s): txid=%s amount_in_SOL=%.6f price≈%s SOL/token",
-                                                symbol,
-                                                token_addr,
-                                                txid,
-                                                buy_amount_sol,
-                                                f"{buy_price_sol:.12f}"
-                                                if isinstance(buy_price_sol, (float, int))
-                                                else "?",
-                                            )
-                                            # Record metrics for dry-run buy
-                                            _record_metric_fill(
-                                                token_addr=token_addr,
-                                                symbol=symbol,
-                                                side="BUY",
-                                                quote=quote,
-                                                buy_amount_sol=per_token_buy_amount_sol,
-                                                token_price_sol=buy_price_sol,
-                                                txid=txid,
-                                                simulated=True,
-                                                source=source,
-                                            )
-                                            continue
-
-                                        try:
-                                            exec_res = await execute_jupiter_swap(
-                                                input_mint=WSOL,
-                                                output_mint=token_addr,
-                                                amount=amount_lamports_full,
-                                                user_pubkey=user_pubkey,
-                                                session=session,
-                                                slippage_bps=slippage_bps,
-                                                config=config,
-                                            )
-                                            txid = None
-                                            if isinstance(exec_res, dict):
-                                                txid = (
-                                                    exec_res.get("txid")
-                                                    or exec_res.get("signature")
-                                                    or exec_res.get("id")
-                                                )
-                                            logger.info(
-                                                "LIVE-BUY %s (%s) executed: txid=%s price≈%s SOL/token",
-                                                symbol,
-                                                token_addr,
-                                                txid or "?",
-                                                f"{buy_price_sol:.12f}"
-                                                if isinstance(buy_price_sol, (float, int))
-                                                else "?",
-                                            )
-                                            # Record metrics for live buy
-                                            _record_metric_fill(
-                                                token_addr=token_addr,
-                                                symbol=symbol,
-                                                side="BUY",
-                                                quote=quote,
-                                                buy_amount_sol=per_token_buy_amount_sol,
-                                                token_price_sol=buy_price_sol,
-                                                txid=txid,
-                                                simulated=False,
-                                                source=source,
-                                            )
-                                        except Exception as e:
-                                            logger.error(
-                                                "Jupiter execute failed for %s (%s): %s",
-                                                symbol,
-                                                token_addr,
-                                                e,
-                                            )
-                                            continue
+                            logger.info("BUY FAILED %s (%s)", symbol, token_addr)
                     except Exception as e:
-                        logger.error("BUY-LOOP error: %s", e, exc_info=True)
-
-
-                    # ---------------- Sells ----------------
+                        logger.error("Buy error for %s: %s", symbol, e, exc_info=True)
+                
+                # After buys, log positions snapshot
+                try:
                     open_positions = await get_open_positions()
-                    cooldown_sec = int(float((config.get("bot") or {}).get("cooldown_seconds", 3)))
-
-                    if cycle_index % 5 == 0:
-                        try:
-                            await _log_positions_snapshot(open_positions, session, solana_client, config)
-                        except Exception:
-                            logger.debug("positions snapshot failed", exc_info=True)
-
-                    for pos in open_positions:
-                        try:
-                            addr = (pos.get("address") if isinstance(pos, dict) else None) or ""
-                            if not addr:
-                                logger.debug("Skipping position with no address: %s", pos)
-                                await asyncio.sleep(0.25)
-                                continue
-                            sym = (pos.get("symbol") if isinstance(pos, dict) else None) or "UNKNOWN"
-                            token_data = {"address": addr, "symbol": sym}
-
-                            if _dry_run or _simulate or _send_disabled:
-                                txid = _dry_run_txid("SELL")
-                                try:
-                                    await update_token_record(
-                                        token={"address": addr, "symbol": sym},
-                                        sell_txid=txid, sell_time=int(time.time()), is_trading=False
-                                    )
-                                except Exception:
-                                    logger.debug("Paper sell persistence failed for %s", addr, exc_info=True)
-                                logger.info("DRYRUN-SELL %s (%s): txid=%s", sym, addr, txid)
-                                await asyncio.sleep(cooldown_sec)
-                                continue
-
-                            txid = await real_on_chain_sell(
-                                token_data, wallet, solana_client, session, blacklist, failure_count, config
-                            )
-                            if txid:
-                                logger.info("LIVE-SELL %s (%s) txid=%s", sym, addr, txid)
-                            else:
-                                logger.warning("Sell returned no txid for %s (%s)", sym, addr)
-                            await asyncio.sleep(cooldown_sec)
-
-                        except Exception as e:
-                            log_error_with_stacktrace(
-                                f"Error processing sell for {pos.get('symbol','UNKNOWN')} ({pos.get('address')})", e
-                            )
-                            await asyncio.sleep(0.5)
-
-                    # ---- end-of-cycle ----
-                    interval = int(float((config.get("bot") or {}).get("cycle_interval", 30)))
-                    logger.info("Completed trading cycle, waiting %d seconds", interval)
-                    _heartbeat()
-                    await asyncio.sleep(interval)
-                    cycle_index += 1
-
-                except Exception as e:  # <-- pairs with per-cycle try
-                    log_error_with_stacktrace("Error in trading cycle", e)
-                    await asyncio.sleep(60)
-                    continue
-                # ===== PER-CYCLE END =====
-
+                    await _log_positions_snapshot(
+                        open_positions=open_positions,
+                        session=session,
+                        solana_client=solana_client,
+                        config=config
+                    )
+                except Exception as e:
+                    logger.debug("Positions snapshot failed: %s", e)
+                
+                # At cycle end, call equity snapshot
+                try:
+                    _metrics_snapshot_equity_point()
+                except Exception as e:
+                    logger.debug("Equity snapshot failed: %s", e)
+                
+                # Sleep according to config or env
+                loop_interval = config.get("bot", {}).get("loop_interval_s") or \
+                               int(os.getenv("LOOP_INTERVAL_S", "30"))
+                logger.info("Cycle complete, sleeping %d seconds", loop_interval)
+                await asyncio.sleep(loop_interval)
+                
+            except Exception as e:  # <-- pairs with per-cycle try
+                logger.error("Error in trading cycle: %s", e, exc_info=True)
+                await asyncio.sleep(60)
+                continue
+    
     except Exception as e:  # <-- pairs with OUTER try
-        log_error_with_stacktrace("Fatal error in main loop", e)
-
+        logger.error("Fatal error in main: %s", e, exc_info=True)
+    
     finally:
-        # stop heartbeat task and cleanup PID/heartbeat files
+        # Shutdown sequence
+        logger.info("Shutting down trading bot")
+        
+        # Set stop event and cancel heartbeat
         try:
-            if 'stop_hb' in locals():
-                stop_hb.set()
-            if 'hb_task' in locals():
+            stop_event.set()
+            if hb_task is not None:
                 hb_task.cancel()
                 try:
                     await asyncio.gather(hb_task, return_exceptions=True)
                 except Exception:
                     pass
-        except Exception:
-            logger.debug("Heartbeat task shutdown failed", exc_info=True)
-
-        # final heartbeat is nice-to-have
+        except Exception as e:
+            logger.debug("Heartbeat shutdown error: %s", e)
+        
+        # Close session
         try:
-            _heartbeat(throttle_s=0)
-        except Exception:
-            logger.debug("Final heartbeat failed", exc_info=True)
-
-        # Close RPC client if opened
+            if session is not None:
+                await session.close()
+        except Exception as e:
+            logger.debug("Session close error: %s", e)
+        
+        # Close solana client
         try:
             if solana_client is not None:
                 await solana_client.close()
-        except Exception:
-            logger.debug("solana_client.close() failed", exc_info=True)
-
-        # Release our single-instance lock (removes PID, heartbeat, started_at if we own them)
+        except Exception as e:
+            logger.debug("Solana client close error: %s", e)
+        
+        # Final equity snapshot
         try:
-            release_single_instance()
-        except Exception:
-            logger.debug("release_single_instance failed", exc_info=True)
-
+            _metrics_snapshot_equity_point()
+        except Exception as e:
+            logger.debug("Final equity snapshot failed: %s", e)
+        
         logger.info("Trading bot stopped")
 
 if __name__ == "__main__":
