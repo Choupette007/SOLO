@@ -1,0 +1,19 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime artifacts & secrets
+logs/
+*.log
+*.sqlite3
+*.db
+.env
