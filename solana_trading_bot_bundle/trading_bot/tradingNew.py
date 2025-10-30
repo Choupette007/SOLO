@@ -279,10 +279,15 @@ def attach_patterns_if_available(token: dict) -> None:
     If token has OHLC arrays or a prebuilt pandas DataFrame, attempt to attach
     pattern booleans (pat_<name>_last) in-place. Defensive: returns silently if
     required libs or data are missing.
+    
+    When a pandas DataFrame is available, converts it to an OHLC dict of lists
+    before calling the patterns classifier (keys: open/high/low/close/volume).
+    Falls back to previous behavior if not a DataFrame.
     """
     try:
-        if not _patterns_module:
+        if not _classify_patterns:
             return
+        
         # Prefer a pandas DataFrame if present
         df = None
         if _pd and isinstance(token.get("_ohlc_df"), _pd.DataFrame):
@@ -308,17 +313,34 @@ def attach_patterns_if_available(token: dict) -> None:
                     df = None
         if df is None:
             return
-        # call classifier if present
+        
+        # Convert DataFrame to dict of lists for patterns classifier
         try:
-            pat_hits = _patterns_module.classify_patterns(df)  # defensive: may raise
+            if _pd and isinstance(df, _pd.DataFrame):
+                # Build OHLC dict of lists (keys: open/high/low/close, plus volume if present)
+                ohlc_dict = {
+                    "open": df["open"].tolist() if "open" in df.columns else [],
+                    "high": df["high"].tolist() if "high" in df.columns else [],
+                    "low": df["low"].tolist() if "low" in df.columns else [],
+                    "close": df["close"].tolist() if "close" in df.columns else [],
+                }
+                if "volume" in df.columns:
+                    ohlc_dict["volume"] = df["volume"].tolist()
+                
+                # Call classifier with dict of lists
+                pat_hits = _classify_patterns(ohlc_dict)
+            else:
+                # Fallback: pass DataFrame directly
+                pat_hits = _classify_patterns(df)
         except Exception:
             pat_hits = {}
+        
         # attach booleans for last row existence if classifier returns series/dicts
         for name, arr in (pat_hits or {}).items():
             try:
                 # arr could be list-like (per-bar); set token field to last value boolean
                 if isinstance(arr, (list, tuple)):
-                    token[f"pat_{name}_last"] = bool(arr[-1])
+                    token[f"pat_{name}_last"] = bool(arr[-1]) if arr else False
                 else:
                     token[f"pat_{name}_last"] = bool(arr)
             except Exception:
@@ -1176,179 +1198,6 @@ async def _enrich_tokens_with_price_change_lazy(session, tokens, logger, blackli
 
     return fixed or _neutral_fallback(tokens)
 
-    # Resolve the real enrichment function (package or bundled)
-    try:
-        from ..price_enrichment_helper_file import enrich_tokens_with_price_change  # type: ignore
-    except Exception:
-        try:
-            from solana_trading_bot_bundle.price_enrichment_helper_file import enrich_tokens_with_price_change  # type: ignore
-        except Exception:
-            logger.warning("Price-change enrichment module missing; skipping enrichment this cycle.")
-            return _neutral_fallback(tokens)
-
-    # Decide whether to disable Birdeye for this call
-    import os
-    global _BIRDEYE_401_SEEN
-    disable_birdeye = False
-    try:
-        _birdeye_allowed_fn = globals().get("_birdeye_allowed")
-        _global_cfg = globals().get("GLOBAL_CONFIG")
-        if callable(_birdeye_allowed_fn) and not _birdeye_allowed_fn(_global_cfg):
-            disable_birdeye = True
-    except Exception:
-        pass
-    if os.getenv("BIRDEYE_ENABLE", "1") == "0":
-        disable_birdeye = True
-    if os.getenv("FORCE_DISABLE_BIRDEYE", "0") == "1":
-        disable_birdeye = True
-    if "_BIRDEYE_401_SEEN" in globals() and _BIRDEYE_401_SEEN:
-        disable_birdeye = True
-    if not os.getenv("BIRDEYE_API_KEY"):
-        disable_birdeye = True
-
-    restore_env = None
-    if disable_birdeye:
-        restore_env = os.getenv("BIRDEYE_ENABLE")
-        os.environ["BIRDEYE_ENABLE"] = "0"
-
-    try:
-        # Call the real thing
-        result = await enrich_tokens_with_price_change(session, tokens, logger, blacklist, failure_count)
-
-        # Coerce to list and guard against empties
-        if not result:
-            logger.warning("Enrichment returned no data; using neutral deltas for %d tokens.", len(tokens))
-            return _neutral_fallback(tokens)
-        if not isinstance(result, list):
-            try:
-                result = list(result)
-            except Exception:
-                logger.warning("Enrichment returned non-list; using neutral deltas.")
-                return _neutral_fallback(tokens)
-        if not result:
-            return _neutral_fallback(tokens)
-
-        # Merge enriched rows back onto originals by address + normalize
-        src_by_addr = {t.get("address"): t for t in tokens if isinstance(t.get("address"), str) and t.get("address")}
-        sanitized: list[dict] = []
-        for item in result:
-            item = dict(item) if isinstance(item, dict) else {}
-            addr = item.get("address")
-            base = src_by_addr.get(addr, {}) if addr else {}
-
-            t = dict(base)  # retain original identity fields
-
-            # --- pull fields from enrichment row (Birdeye or blended) ---
-            price = item.get("price", item.get("lastPrice"))
-            if price is None:
-                price = item.get("value") or item.get("last_price")
-
-            mc = item.get("mc", item.get("market_cap"))
-            if mc is None:
-                mc = item.get("fdv")
-
-            liq        = item.get("liquidity")
-            holder_cnt = item.get("holderCount")
-
-            # percent changes (various spellings)
-            pc1h  = item.get("priceChange1h",  item.get("price_change_1h"))
-            pc6h  = item.get("priceChange6h",  item.get("price_change_6h"))
-            pc24h = item.get("priceChange24h", item.get("price_change_24h"))
-            pc5m  = item.get("priceChange5m",  item.get("price_change_5m"))
-
-            # ---- canonical 24h volume (NEVER leave missing) ----
-            vol_candidates = [
-                item.get("volume_24h"),
-                item.get("dex_volume_24h"),
-                item.get("v24hUSD"),
-                item.get("volume24h"),
-                base.get("volume_24h"),
-                base.get("v24hUSD"),
-                base.get("volume24h"),
-            ]
-            best_vol = next((v for v in vol_candidates if isinstance(v, (int, float)) and float(v) > 0.0), 0.0)
-            # keep if enrichment gave 0 but base had a value
-            t["volume_24h"] = _f(best_vol, _f(base.get("volume_24h", 0.0)))
-
-            # --- augment, don't overwrite with zeros/None ---
-            existing_price = _f(t.get("price", 0.0))
-            if isinstance(price, (int, float)) and float(price) > 0:
-                t["price"] = float(price)
-            else:
-                t["price"] = existing_price
-
-            existing_mc = _f(t.get("mc", t.get("market_cap", 0.0)))
-            if isinstance(mc, (int, float)) and float(mc) > 0:
-                t["mc"] = float(mc)
-                t["market_cap"] = float(mc)  # mirror for downstream readers
-            else:
-                t["mc"] = existing_mc
-                if _f(t.get("market_cap", 0.0)) <= 0:
-                    t["market_cap"] = existing_mc
-
-            # Liquidity / holders
-            t["liquidity"]   = _f(liq, t.get("liquidity", 0.0))
-            t["holderCount"] = _i(holder_cnt, t.get("holderCount", 0))
-
-            # Percent changes (0 can be legit)
-            t["pct_change_1h"]  = _f(pc1h,  0.0)
-            t["pct_change_6h"]  = _f(pc6h,  0.0)
-            t["pct_change_24h"] = _f(pc24h, 0.0)
-            t["pct_change_5m"]  = _f(pc5m,  0.0)
-
-            # --- timestamp mapping; normalize ms→s and clamp future ---
-            ts_candidates = [
-                item.get("updated_at"),
-                item.get("last_trade_unix"),
-                item.get("created_at"),
-                item.get("pairCreatedAt"),
-                item.get("timestamp"),
-            ]
-            ts_new = next((x for x in ts_candidates if isinstance(x, (int, float))), None)
-            if ts_new is not None:
-                ts_new = int(ts_new)
-                if ts_new > 10_000_000_000:  # ms→s
-                    ts_new //= 1000
-                now = int(time.time())
-                if ts_new > now + 600:       # clamp accidental future timestamps
-                    ts_new = now
-                t["timestamp"] = max(int(t.get("timestamp") or 0), ts_new)
-
-            ds_url  = item.get("dexscreenerUrl") or t.get("dexscreenerUrl") or ""
-            ds_pair = item.get("dsPairAddress")  or t.get("dsPairAddress")  or ""
-            t["dexscreenerUrl"] = ds_url if isinstance(ds_url, str) else ""
-            t["dsPairAddress"]  = ds_pair if isinstance(ds_pair, str) else ""
-
-            try:
-                from .utils import format_market_cap
-            except Exception:
-                from solana_trading_bot_bundle.trading_bot.utils import format_market_cap
-            t["mcFormatted"] = format_market_cap(_f(t.get("market_cap", t.get("mc", 0.0)), 0.0))
-
-            if "address" not in t and "address" in base:
-                t["address"] = base["address"]
-
-            sanitized.append(t)
-
-        return sanitized
-
-
-    except Exception as e:
-        msg = str(e)
-        if "401" in msg or "Unauthorized" in msg or "unauthorized" in msg:
-            logger.warning("Birdeye 401 encountered during enrichment; disabling for the rest of this run.")
-            _BIRDEYE_401_SEEN = True
-        else:
-            logger.debug("Enrichment raised; continuing without enriched data", exc_info=True)
-        return _neutral_fallback(tokens)
-    finally:
-        if disable_birdeye:
-            if restore_env is None:
-                os.environ.pop("BIRDEYE_ENABLE", None)
-            else:
-                os.environ["BIRDEYE_ENABLE"] = restore_env
-   
-
 # ---- Merge & dedupe helper (address-canonical) ------------------------------
 def _merge_by_address(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
@@ -1579,6 +1428,23 @@ async def _build_live_shortlist(
         enriched = pre_cut
         for t in enriched:
             t.setdefault("_enriched", False)
+
+    # 6.5) ATTACH PATTERNS AND BOLLINGER BANDS (best-effort, after enrichment)
+    for t in enriched:
+        try:
+            attach_patterns_if_available(t)
+        except Exception:
+            try:
+                logger.debug("Pattern attachment failed for %s", t.get("symbol", t.get("address")), exc_info=True)
+            except Exception:
+                pass
+        try:
+            _attach_bbands_if_available(t)
+        except Exception:
+            try:
+                logger.debug("Bollinger bands attachment failed for %s", t.get("symbol", t.get("address")), exc_info=True)
+            except Exception:
+                pass
 
     # 7) DIAGNOSTICS: enrichment coverage
     def _count_truthy(xs, key):
@@ -3817,6 +3683,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STALE",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=True,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for dry-run STALE sell %s", symbol, exc_info=True)
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3835,6 +3716,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STALE",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=False,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for live STALE sell %s", symbol, exc_info=True)
 
             await mark_token_sold(
                 token_address=token_address,
@@ -3885,6 +3781,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="MAX_HOLD",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=True,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for dry-run MAX_HOLD sell %s", symbol, exc_info=True)
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3903,6 +3814,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="MAX_HOLD",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=False,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for live MAX_HOLD sell %s", symbol, exc_info=True)
 
             await mark_token_sold(
                 token_address=token_address,
@@ -3955,6 +3881,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STOP_LOSS",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=True,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for dry-run STOP_LOSS sell %s", symbol, exc_info=True)
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -3973,6 +3914,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="STOP_LOSS",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=False,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for live STOP_LOSS sell %s", symbol, exc_info=True)
 
             await mark_token_sold(token_address=token_address, sell_price=float(current_price), sell_txid=str(txid), sell_time=now_ts)
             logger.info(f"[{symbol}] Stop-loss executed. txid={txid}")
@@ -4019,6 +3975,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP1",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance * pct if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=True,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for dry-run TP1 sell %s", symbol, exc_info=True)
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -4037,6 +4008,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP1",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance * pct if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=False,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for live TP1 sell %s", symbol, exc_info=True)
 
             # Activate trailing & breakeven protection
             ts["tp1_done"] = True
@@ -4088,6 +4074,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP2",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance * pct if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=True,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for dry-run TP2 sell %s", symbol, exc_info=True)
             else:
                 txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                 if not txid:
@@ -4106,6 +4107,21 @@ async def real_on_chain_sell(
                     source="jupiter",
                     reason="TP2",
                 )
+                # Best-effort: also record to newer metrics wrapper
+                try:
+                    qty_estimate = token_balance * pct if token_balance else 0.0
+                    _metrics_on_fill(
+                        token_addr=token_address,
+                        symbol=symbol,
+                        side="SELL",
+                        qty=qty_estimate,
+                        price_usd=current_price if current_price else 0.0,
+                        fee_usd=0.0,
+                        txid=txid,
+                        simulated=False,
+                    )
+                except Exception:
+                    logger.debug("_metrics_on_fill failed for live TP2 sell %s", symbol, exc_info=True)
 
             ts["tp2_done"] = True
             ts["trail_pct"] = exit_cfg["trail_pct_moonbag"]
@@ -4162,6 +4178,21 @@ async def real_on_chain_sell(
                         source="jupiter",
                         reason="TRAIL",
                     )
+                    # Best-effort: also record to newer metrics wrapper
+                    try:
+                        qty_estimate = token_balance if token_balance else 0.0
+                        _metrics_on_fill(
+                            token_addr=token_address,
+                            symbol=symbol,
+                            side="SELL",
+                            qty=qty_estimate,
+                            price_usd=current_price if current_price else 0.0,
+                            fee_usd=0.0,
+                            txid=txid,
+                            simulated=True,
+                        )
+                    except Exception:
+                        logger.debug("_metrics_on_fill failed for dry-run TRAIL sell %s", symbol, exc_info=True)
                 else:
                     txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
                     if not txid:
@@ -4180,6 +4211,21 @@ async def real_on_chain_sell(
                         source="jupiter",
                         reason="TRAIL",
                     )
+                    # Best-effort: also record to newer metrics wrapper
+                    try:
+                        qty_estimate = token_balance if token_balance else 0.0
+                        _metrics_on_fill(
+                            token_addr=token_address,
+                            symbol=symbol,
+                            side="SELL",
+                            qty=qty_estimate,
+                            price_usd=current_price if current_price else 0.0,
+                            fee_usd=0.0,
+                            txid=txid,
+                            simulated=False,
+                        )
+                    except Exception:
+                        logger.debug("_metrics_on_fill failed for live TRAIL sell %s", symbol, exc_info=True)
 
                 await mark_token_sold(token_address=token_address, sell_price=float(current_price), sell_txid=str(txid), sell_time=now_ts)
                 logger.info(f"[{symbol}] Trailing stop exit complete. txid={txid}")
@@ -4845,6 +4891,23 @@ async def main() -> None:
                                                 simulated=True,
                                                 source=source,
                                             )
+                                            # Best-effort: also record to newer metrics wrapper
+                                            try:
+                                                qty_estimate = 0.0
+                                                if buy_price_sol and buy_price_sol > 0:
+                                                    qty_estimate = per_token_buy_amount_sol / buy_price_sol
+                                                _metrics_on_fill(
+                                                    token_addr=token_addr,
+                                                    symbol=symbol,
+                                                    side="BUY",
+                                                    qty=qty_estimate,
+                                                    price_usd=buy_price_sol if buy_price_sol else 0.0,
+                                                    fee_usd=0.0,
+                                                    txid=txid,
+                                                    simulated=True,
+                                                )
+                                            except Exception:
+                                                logger.debug("_metrics_on_fill failed for dry-run buy %s", symbol, exc_info=True)
                                             continue
 
                                         try:
@@ -4885,6 +4948,23 @@ async def main() -> None:
                                                 simulated=False,
                                                 source=source,
                                             )
+                                            # Best-effort: also record to newer metrics wrapper
+                                            try:
+                                                qty_estimate = 0.0
+                                                if buy_price_sol and buy_price_sol > 0:
+                                                    qty_estimate = per_token_buy_amount_sol / buy_price_sol
+                                                _metrics_on_fill(
+                                                    token_addr=token_addr,
+                                                    symbol=symbol,
+                                                    side="BUY",
+                                                    qty=qty_estimate,
+                                                    price_usd=buy_price_sol if buy_price_sol else 0.0,
+                                                    fee_usd=0.0,
+                                                    txid=txid,
+                                                    simulated=False,
+                                                )
+                                            except Exception:
+                                                logger.debug("_metrics_on_fill failed for live buy %s", symbol, exc_info=True)
                                         except Exception as e:
                                             logger.error(
                                                 "Jupiter execute failed for %s (%s): %s",
