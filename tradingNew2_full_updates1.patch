@@ -1,0 +1,141 @@
+*** Begin Patch
+*** Update File: solana_trading_bot_bundle/trading_bot/tradingNew2.py
+@@
+ def _metrics_on_fill(
+     token_addr: str,
+     symbol: str,
+     side: str,
+     qty: float,
+     price_usd: float,
+     fee_usd: float,
+     txid: str | None,
+     simulated: bool,
+     **meta
+ ) -> None:
+@@
+-    try:
+-        global _metrics_store, METRICS
+-        ms = _metrics_store or METRICS
+-        if not ms:
+-            return
+-
+-        # Try several variants of fill APIs to maximize compatibility:
+-        # 1) record_fill (preferred)
+-        # 2) on_fill (alternate)
+-        # 3) record (generic)
+-        # All calls are best-effort and exceptions are swallowed.
+-        if hasattr(ms, "record_fill"):
+-            try:
+-                ms.record_fill(
+-                    token_addr=token_addr,
+-                    side=side.upper(),
+-                    qty=qty,
+-                    price_usd=price_usd,
+-                    fee_usd=fee_usd,
+-                    dry_run=simulated,
+-                    txid=txid,
+-                    symbol=symbol,
+-                    **meta,
+-                )
+-                return
+-            except Exception:
+-                # fall through to other APIs
+-                pass
+-
+-        if hasattr(ms, "on_fill"):
+-            try:
+-                # metrics_engine.on_fill historically used a slightly different signature in some versions
+-                ms.on_fill(
+-                    token_addr=token_addr,
+-                    symbol=symbol,
+-                    side=side.upper(),
+-                    qty=qty,
+-                    price_usd=price_usd,
+-                    fee_usd=fee_usd,
+-                    txid=txid,
+-                    dry_run=simulated,
+-                    **meta,
+-                )
+-                return
+-            except Exception:
+-                pass
+-
+-        if hasattr(ms, "record"):
+-            try:
+-                ms.record({
+-                    "type": "fill",
+-                    "token": token_addr,
+-                    "symbol": symbol,
+-                    "side": side.upper(),
+-                    "qty": qty,
+-                    "price_usd": price_usd,
+-                    "fee_usd": fee_usd,
+-                    "txid": txid,
+-                    "simulated": simulated,
+-                    **meta,
+-                })
+-                return
+-            except Exception:
+-                pass
++    try:
++        global _metrics_store, METRICS
++        ms = _metrics_store or METRICS
++        if not ms:
++            return
++
++        # Try several known APIs in order of preference; swallow all exceptions.
++        # 1) record_fill (newer structured API)
++        if hasattr(ms, "record_fill"):
++            try:
++                ms.record_fill(
++                    token_addr=token_addr,
++                    side=side.upper(),
++                    qty=qty,
++                    price_usd=price_usd,
++                    fee_usd=fee_usd,
++                    dry_run=simulated,
++                    txid=txid,
++                    symbol=symbol,
++                    **meta,
++                )
++                return
++            except Exception:
++                pass
++
++        # 2) on_fill (older / alternate API)
++        if hasattr(ms, "on_fill"):
++            try:
++                ms.on_fill(
++                    token_addr=token_addr,
++                    symbol=symbol,
++                    side=side.upper(),
++                    qty=qty,
++                    price_usd=price_usd,
++                    fee_usd=fee_usd,
++                    txid=txid,
++                    dry_run=simulated,
++                    **meta,
++                )
++                return
++            except Exception:
++                pass
++
++        # 3) generic record() fallback
++        if hasattr(ms, "record"):
++            try:
++                ms.record({
++                    "type": "fill",
++                    "token": token_addr,
++                    "symbol": symbol,
++                    "side": side.upper(),
++                    "qty": qty,
++                    "price_usd": price_usd,
++                    "fee_usd": fee_usd,
++                    "txid": txid,
++                    "simulated": simulated,
++                    **meta,
++                })
++                return
++            except Exception:
++                pass
+*** End Patch

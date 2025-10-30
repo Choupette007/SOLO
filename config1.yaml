@@ -1,0 +1,298 @@
+# =========================
+# SOLO Meme Coin Trading Bot - CONFIG (Dry Run)
+# =========================
+
+# -------- RugCheck configuration --------
+rugcheck:
+  enabled: true
+  api_base: "https://api.rugcheck.xyz/v1"
+  allow_if_api_down: true
+  hard_fail_on_missing_auth: false
+  block_dangerous_on_trade: true
+  jwt_env: "RUGCHECK_JWT"          # or RUGCHECK_JWT_TOKEN
+  api_key_env: "RUGCHECK_API_KEY"
+  danger_labels_blocklist: ["dangerous", "scam", "honeypot", "malicious", "blocked"]
+
+# -------- Wallet --------
+wallet:
+  address: "YOUR_WALLET_ADDRESS"     # optional; for UI/logs
+  private_key_env: "SOLANA_PRIVATE_KEY"
+  secret_key_env: "SOLANA_PRIVATE_KEY"
+  min_balance_sol: 0.00              # dry-run: never block on balance
+
+# -------- Solana (launcher & bot) --------
+solana:
+  # Keep both keys since some code paths read one or the other
+  rpc_url: "https://api.mainnet-beta.solana.com"
+  rpc_endpoint: "https://api.mainnet-beta.solana.com"
+  rpc_timeout_seconds: 15
+
+# -------- Database & Logging --------
+database:
+  token_cache_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+
+logging:
+  log_file_path: ""                  # let app choose OS-specific default
+  level: "INFO"
+  max_bytes: 2000000
+  backup_count: 3
+
+paths:
+  # Optional: mirror here so the GUI’s “Paths & Storage” tab shows exactly the same value
+  token_cache_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+  log_dir: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\logs"  
+
+# -------- Source toggles (main switches still in .env) --------
+sources:
+  raydium_enabled: 0           # OFF for dry-run discovery
+  birdeye_enabled: 1             # OFF for dry-run discovery
+
+# -------- API/Discovery controls --------
+discovery:
+  # Built-in caps so beta testers don't need env vars
+  workset_cap: 100
+  quality_cap: 60
+  new_coin_cap: 40
+  spike_cap: 8
+
+  exclude_symbols:
+    - WSOL
+    - Wrapped SOL
+    - USDC
+    - USDT
+    - JUPSOL
+    - Jupiter Staked SOL
+  exclude_addresses:
+    - So11111111111111111111111111111111111111112  # SOL
+    - EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v  # USDC
+    - jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v   # JUP staked SOL
+
+  dexscreener_pages: 5
+  dexscreener_per_page: 100
+  dexscreener_queries:
+    - solana
+    - bonk
+    - pepe
+    - doge
+    - cat
+    - meme
+    - pump
+    - moon
+    - degen
+    - ai
+    - game
+
+  dexscreener_post_cap: 400
+
+  raydium_max_pairs: 0
+  raydium_page_size: 0
+
+  birdeye_max_tokens: 600
+
+  shortlist_per_bucket: 15
+
+  backoff_max_retries: 5
+  backoff_base_delay: 1.0
+
+  rugcheck_in_discovery: false
+  require_rugcheck_pass: false
+
+  max_price_change: 1500.0
+  max_price_change_hard: 7500.00
+  min_price_for_pct: 0.00002
+  min_liq_for_big_pct: 3000.0
+  min_vo_for_big_pct: 7500.0
+
+  newly_launched:
+    max_token_age_minutes: 480
+    liquidity_threshold: 400
+    volume_threshold: 200
+    max_rugcheck_score: 5000
+
+  low_cap:
+    max_market_cap: 100000
+    liquidity_threshold: 500
+    volume_threshold: 500
+    max_rugcheck_score: 5000
+
+  mid_cap:
+    max_market_cap: 500000
+    liquidity_threshold: 3000
+    volume_threshold: 1500
+    max_rugcheck_score: 5000
+
+  large_cap:
+    liquidity_threshold: 20000
+    volume_threshold: 5000
+    max_rugcheck_score: 5000
+
+# -------- Safety / eligibility: holders (optional) --------
+holders:
+  enabled: false                      # keep OFF while Birdeye is disabled
+  timeout_seconds: 8
+  allow_if_api_down: true
+  min_holders:
+    low_cap: 50
+    mid_cap: 100
+    large_cap: 250
+    newly_launched: 25
+  providers:
+    birdeye:
+      api_key: "${BIRDEYE_API_KEY}"
+      holders_url: "https://api.birdeye.so/defi/token/holders"
+      overview_url: "https://api.birdeye.so/defi/token/overview"
+    solscan_pro:
+      api_key: "${SOLSCAN_PRO_API_KEY}"
+    helius:
+      api_key: "${HELIUS_API_KEY}"
+      url: "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+      method_summary: "getTokenHoldersSummary"
+      method_top: "getTokenTopHolders"
+    public_solscan:
+      enabled: true
+
+concentration:
+  enabled: false
+  top_n: 10
+  allow_if_api_down: true
+  max_percent_per_category:
+    low_cap: 30
+    mid_cap: 35
+    large_cap: 40
+    newly_launched: 30
+
+# -------- Signals & Patterns (NEW) --------
+signals:
+  enable: true           # master on/off for indicators enrichment
+  ranking_tilt: true     # enables tech tie-breaker in trading.py
+
+  ohlcv:
+    interval: "1m"       # 1m candles for fast timing
+    limit: 200           # bars to compute MACD/BB/TD9 comfortably
+
+  rsi:
+    enable: true
+    period: 14
+
+  macd:
+    enable: true
+    fast: 12
+    slow: 26
+    signal: 9
+
+  bollinger:
+    enable: true
+    period: 20
+    stddev: 2.0
+
+  td9:
+    enable: true
+    lookback: 30
+
+patterns:
+  enable: true
+  list: ["bullish_engulfing","bearish_engulfing","hammer","shooting_star","doji"]
+
+# -------- Bot execution settings (runtime controls) --------
+trading:
+  enabled: true              # CRITICAL: must be true for trading logic (even dry run)
+  dry_run: true              # CRITICAL: enables dry-run (no real trades)
+  simulate: true             # OK for dry-run, ensures txs are never broadcast
+  send_transactions: false   # CRITICAL: prevents any real transaction
+  paper_trade_ledger: true   # records simulated trades/P&L
+
+  prefer_persisted_shortlist: false   
+  db_shortlist_max_age_s: 120         # optional guard if enabled 
+  db_shortlist_min_count: 10          # optional guard if enabled
+
+  min_order_usd: 50
+  max_order_usd: 500
+  max_open_positions: 5
+  slippage_bps: 150
+  risk:
+    block_if_safety_unknown: false
+    require_rugcheck_pass_for_trade: false
+  jupiter:
+    use_version: 6
+    route_mode: "ExactIn"
+
+# -------- Scoring (optional tuning) --------
+scoring:
+  mode: "midcap"                      # "midcap" or "conservative"
+  presence_boost_if_birdeye: 1.00     # neutralize Birdeye effect while disabled
+  penalty_if_missing_birdeye: 1.00    # no penalty for missing Birdeye
+
+# -------- Bot (sizing + exits; USED BY utils.get_buy_amount) --------
+bot:
+  enabled: true
+
+  # ---- Option B sizing (active) ----
+  dry_run: true                # keep true while testing
+  buy_percentage: 0.10         # 10% of current SOL wallet per buy
+  min_usd_per_buy: 50.0        # USD floor per buy
+  per_trade_sol: 0             # 0 disables fixed-size cap; % + USD floor used
+
+  required_sol: 0.00           # dry-run: don't block on balance
+  buy_slippage_bps: 150
+  sell_slippage_bps: 150
+
+  # Optional: paper sizing budget (if your code reads it)
+  paper_budget_sol: 1.0
+
+  # Core exits / guardrails
+  profit_target: 1.25
+  stop_loss: 0.85
+  max_hold_hours: 24
+
+  # --- Aggressive exit / partial TP config ---
+  tp1_x: 1.30
+  tp2_x: 2.00
+  tp1_pct_to_sell: 0.50
+  tp2_pct_of_remaining: 0.60
+  breakeven_plus: 0.02
+  trail_pct_after_tp1: 0.18
+  trail_pct_moonbag: 0.30
+  no_tp_cutoff_hours: 6.0
+  no_tp_min_profit_x: 1.10
+
+  # Loop pacing / cooldowns
+  cycle_interval: 45
+  cooldown_seconds: 6
+
+  # Back-compat / UI mirrors
+  slippage_bps: 150
+  max_open_positions: 5
+  min_order_usd: 50
+  max_order_usd: 500
+  block_if_safety_unknown: false
+  require_rugcheck_pass_for_trade: false
+  jupiter:
+    use_version: 6
+    route_mode: "ExactIn"
+
+  # --- Preflight probe for Jupiter (NEW) ---
+  jupiter_preflight:
+    enabled: true                      # tradability dust-quote probe in trading.py
+    dust_quote_lamports_min: 1000000   # 0.001 SOL minimum
+    dust_quote_fraction_of_buy: 0.01   # 1% of intended buy size (lamports)
+
+# -------- Notifications --------
+notifications:
+  telegram:
+    enabled: true
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+  email:
+    enabled: false
+    smtp_server: ""
+    smtp_user_env: "SMTP_USER"
+    smtp_pass_env: "SMTP_PASS"
+    to: []
+
+# -------- Scoring weights (aggressive defaults) --------
+weights:
+  market_cap: 0.1
+  liquidity: 0.25
+  volume: 0.25
+  price_change: 0.3
+  new_token_bonus: 0.2

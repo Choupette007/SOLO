@@ -1,0 +1,67 @@
+*** Begin Patch
+*** Update File: solana_trading_bot_bundle/trading_bot/tradingNew2.py
+@@
+                 if _skip_onchain_send(config):
+                     txid = _dry_run_txid("sell")
+@@
+                     # Record metrics for dry-run sell (stagnant exit)
+                     _record_metric_fill(
+                         token_addr=token_address,
+                         symbol=symbol,
+                         side="SELL",
+                         quote=quote,
+                         buy_amount_sol=None,
+                         token_price_sol=current_price,
+                         txid=txid,
+                         simulated=True,
+                         source="jupiter",
+                         reason="STALE",
+                     )
++                    # Best-effort new metrics wrapper (dry-run sell)
++                    try:
++                        _metrics_on_fill(
++                            token_addr=token_address,
++                            symbol=symbol,
++                            side="SELL",
++                            qty=0.0,
++                            price_usd=0.0,
++                            fee_usd=0.0,
++                            txid=txid,
++                            simulated=True,
++                            source="jupiter",
++                            reason="STALE",
++                        )
++                    except Exception:
++                        logger.debug("metrics_on_fill failed (dry-run sell - STALE)", exc_info=True)
+                 else:
+@@
+                     # Record metrics for live sell (stagnant exit)
+                     _record_metric_fill(
+                         token_addr=token_address,
+                         symbol=symbol,
+                         side="SELL",
+                         quote=quote,
+                         buy_amount_sol=None,
+                         token_price_sol=current_price,
+                         txid=txid,
+                         simulated=False,
+                         source="jupiter",
+                         reason="STALE",
+                     )
++                    # Best-effort new metrics wrapper (live sell)
++                    try:
++                        _metrics_on_fill(
++                            token_addr=token_address,
++                            symbol=symbol,
++                            side="SELL",
++                            qty=0.0,
++                            price_usd=0.0,
++                            fee_usd=0.0,
++                            txid=txid,
++                            simulated=False,
++                            source="jupiter",
++                            reason="STALE",
++                        )
++                    except Exception:
++                        logger.debug("metrics_on_fill failed (live sell - STALE)", exc_info=True)
+*** End Patch

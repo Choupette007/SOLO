@@ -1,0 +1,83 @@
+*** Begin Patch
+*** Update File: solana_trading_bot_bundle/trading_bot/tradingNew2.py
+@@
+                 if _skip_onchain_send(config):
+                     txid = _dry_run_txid("buy")
+                     _log_trade_event(
+                         "DRYRUN_BUY",
+                         token=symbol,
+                         address=token_address,
+                         lamports=sol_amount_lamports,
+                         slippage_bps=_clamp_bps(int(config['bot'].get('buy_slippage_bps', 50))),
+                         txid=txid
+                     )
+                     # Record metrics for dry-run buy in real_on_chain_buy
+                     _record_metric_fill(
+                         token_addr=token_address,
+                         symbol=symbol,
+                         side="BUY",
+                         quote=quote,
+                         buy_amount_sol=buy_amount,
+                         token_price_sol=token_price,
+                         txid=txid,
+                         simulated=True,
+                         source="jupiter",
+                     )
++            # Best-effort new metrics wrapper (dry-run)
++            try:
++                qty_est = 0.0
++                try:
++                    if token_price and token_price > 0:
++                        qty_est = float(buy_amount) / float(token_price)
++                except Exception:
++                    qty_est = 0.0
++                _metrics_on_fill(
++                    token_addr=token_address,
++                    symbol=symbol,
++                    side="BUY",
++                    qty=qty_est,
++                    price_usd=0.0,
++                    fee_usd=0.0,
++                    txid=txid,
++                    simulated=True,
++                    source="jupiter",
++                )
++            except Exception:
++                logger.debug("metrics_on_fill failed (dry-run buy)", exc_info=True)
+                 else:
+                     txid = await execute_jupiter_swap(quote, str(wallet.pubkey()), wallet, solana_client)
+@@
+             # Record metrics for live buy in real_on_chain_buy
+             _record_metric_fill(
+                 token_addr=token_address,
+                 symbol=symbol,
+                 side="BUY",
+                 quote=quote,
+                 buy_amount_sol=buy_amount,
+                 token_price_sol=token_price,
+                 txid=txid,
+                 simulated=False,
+                 source="jupiter",
+             )
++            # Best-effort new metrics wrapper (live)
++            try:
++                qty_est = 0.0
++                try:
++                    if token_price and token_price > 0:
++                        qty_est = float(buy_amount) / float(token_price)
++                except Exception:
++                    qty_est = 0.0
++                _metrics_on_fill(
++                    token_addr=token_address,
++                    symbol=symbol,
++                    side="BUY",
++                    qty=qty_est,
++                    price_usd=0.0,
++                    fee_usd=0.0,
++                    txid=txid,
++                    simulated=False,
++                    source="jupiter",
++                )
++            except Exception:
++                logger.debug("metrics_on_fill failed (live buy)", exc_info=True)
+*** End Patch

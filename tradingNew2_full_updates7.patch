@@ -1,0 +1,65 @@
+*** Begin Patch
+*** Update File: solana_trading_bot_bundle/trading_bot/tradingNew2.py
+@@
+                 if _skip_onchain_send(config):
+                     txid = _dry_run_txid("sell")
+@@
+                     # Record metrics for dry-run sell (TP1)
+                     _record_metric_fill(
+                         token_addr=token_address,
+                         symbol=symbol,
+                         side="SELL",
+                         quote=quote,
+                         buy_amount_sol=None,
+                         token_price_sol=current_price,
+                         txid=txid,
+                         simulated=True,
+                         source="jupiter",
+                         reason="TP1",
+                     )
++                    try:
++                        _metrics_on_fill(
++                            token_addr=token_address,
++                            symbol=symbol,
++                            side="SELL",
++                            qty=0.0,
++                            price_usd=0.0,
++                            fee_usd=0.0,
++                            txid=txid,
++                            simulated=True,
++                            source="jupiter",
++                            reason="TP1",
++                        )
++                    except Exception:
++                        logger.debug("metrics_on_fill failed (dry-run sell - TP1)", exc_info=True)
+                 else:
+@@
+                     # Record metrics for live sell (TP1)
+                     _record_metric_fill(
+                         token_addr=token_address,
+                         symbol=symbol,
+                         side="SELL",
+                         quote=quote,
+                         buy_amount_sol=None,
+                         token_price_sol=current_price,
+                         txid=txid,
+                         simulated=False,
+                         source="jupiter",
+                         reason="TP1",
+                     )
++                    try:
++                        _metrics_on_fill(
++                            token_addr=token_address,
++                            symbol=symbol,
++                            side="SELL",
++                            qty=0.0,
++                            price_usd=0.0,
++                            fee_usd=0.0,
++                            txid=txid,
++                            simulated=False,
++                            source="jupiter",
++                            reason="TP1",
++                        )
++                    except Exception:
++                        logger.debug("metrics_on_fill failed (live sell - TP1)", exc_info=True)
+*** End Patch

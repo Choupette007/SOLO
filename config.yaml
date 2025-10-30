@@ -1,0 +1,260 @@
+# =========================
+# SOLO Meme Coin Trading Bot - CONFIG (Dry Run)
+# =========================
+
+# ---- Top-level paths expected by the loader/GUI ----
+db_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+log_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\logs\\bot.log"
+
+# =========================
+# SOLO Meme Coin Trading Bot — CONFIG (back-compat superset)
+# =========================
+
+# ---- App & Paths (Windows examples; works cross-platform) ----
+app:
+  name: "SOLOTradingBot"
+  appdata_dir: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot"   # override if needed
+
+# Top-level path hints (some tools/UI read these directly)
+db_path:  "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+log_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\logs\\bot.log"
+
+# -------- Logging --------
+logging:
+  file: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\logs\\bot.log"
+  log_level: "INFO"             # DEBUG/INFO/WARN/ERROR
+  log_rotation_size_mb: 10
+  log_max_files: 5
+
+# -------- Wallet --------
+wallet:
+  address: "YOUR_WALLET_ADDRESS"
+  private_key_env: "SOLANA_PRIVATE_KEY"   # base58 or JSON[64] supported
+  secret_key_env:  "SOLANA_PRIVATE_KEY"
+  min_balance_sol: 0.0
+
+# -------- Solana / RPC --------
+solana:
+  rpc_url: "https://api.mainnet-beta.solana.com"
+  rpc_endpoint: "https://api.mainnet-beta.solana.com"  # alias; some code uses this
+  rpc_timeout: 20
+  commitment: "finalized"
+
+# -------- RugCheck configuration --------
+rugcheck:
+  enabled: true
+  api_base: "https://api.rugcheck.xyz/v1"
+  allow_if_api_down: true
+  hard_fail_on_missing_auth: false
+  block_dangerous_on_trade: true
+  jwt_env: "RUGCHECK_JWT"              # legacy env name (kept)
+  jwt_env_alt: "RUGCHECK_JWT_TOKEN"    # new name used by auto-login helper
+  api_key_env: "RUGCHECK_API_KEY"
+  danger_labels_blocklist: ["dangerous", "scam", "honeypot", "malicious", "blocked"]
+
+# -------- Birdeye enrichment --------
+birdeye:
+  enable: true
+  rps: 4
+  run_cap: 800
+  cycle_cap: 400
+  api_key_env: "BIRDEYE_API_KEY"
+  force_disable_env: "FORCE_DISABLE_BIRDEYE"   # set "1" to force off
+  # Legacy env toggle some older code checks:
+  legacy_enable_env: "BIRDEYE_ENABLE"          # set "1" to enable in legacy paths
+
+# -------- Discovery (Dexscreener, Raydium, Birdeye bulk) --------
+discovery:
+  # Dexscreener controls
+  dexscreener_pages: 5
+  dexscreener_per_page: 75
+  dexscreener_post_cap: 0             # 0 = no extra cap after filtering (utils.get_dex_post_cap reads this)
+
+  # Raydium controls
+  raydium_max_pairs: 400
+  raydium_page_size: 100
+  raydium_max_pools: 800
+
+  # Birdeye bulk discovery limits
+  birdeye_max_tokens: 200
+
+  # Backoff & retry tuning (used by helpers)
+  backoff_max_retries: 5
+  backoff_base_delay: 1.0
+  backoff_jitter_enabled: true
+  backoff_max_sleep_seconds: 120
+
+  # Circuit-breaker for 429s
+  circuit_breaker_on_429: true
+  circuit_breaker_429_threshold: 5
+  circuit_breaker_cooldown_seconds: 60
+
+  # RugCheck at discovery time (keep optional so new tokens remain visible)
+  rugcheck_in_discovery: false
+  require_rugcheck_pass: false
+
+  # Momentum minima (block obvious bleeders; your code reads these)
+  min_price_change_1h: 0.0
+  min_price_change_6h: 0.0
+
+  # ---- Safety filters (GUI/discovery) ----
+  hide_stables: true                   # hide USDC/USDT wrappers in tables
+  exclude_wrapped_staking: true        # skip JitoSOL/mSOL/bSOL wrappers, LPs
+  symbol_blocklist: ["USDC", "USDT"]
+  name_regex_blocklist: ["\\blp\\b", "staked", "staking"]
+  min_liquidity_usd: 0                 # set >0 to filter
+  min_market_cap_usd: 0
+  max_market_cap_usd: 0               # 0 means no max
+  min_holders: 0
+
+# -------- Signals / Indicator gates --------
+signals:
+  # BBands "flip" strategy hook (used in utils.score_token_dispatch)
+  bbands_flip:
+    enable: true
+    reject_shorts: true               # if close < lower -> hard reject
+    long_bonus_points: 15             # bonus if close > upper and width >= min_width
+    long_bonus_points_narrow: 5       # bonus for narrow bands
+    min_width: 0.015                  # (upper-lower)/basis threshold
+
+  # Optional indicator thresholds (if you later wire them in)
+  rsi:
+    enable: false
+    period: 14
+    min_for_entry: 48
+    max_for_entry: 80
+  macd:
+    enable: false
+    fast: 12
+    slow: 26
+    signal: 9
+    require_cross: false
+  td9:
+    enable: false
+    lookback: 30
+    require_td9_up: false
+
+# -------- Scoring mode --------
+scoring:
+  mode: "midcap"                      # "midcap" | "conservative"
+  # Tunables for future scoring versions could live here.
+
+# -------- Category bands (used by shortlist & cosmetic display) --------
+categories:
+  large_cap_min_usd: 500000           # >= this -> Large
+  mid_cap_min_usd:   100000           # >= this -> Mid (and < large)
+  low_cap_max_usd:    99999           # <= this -> Low
+
+# -------- Shortlist selection (top-N per bucket for GUI/trader) --------
+shortlist:
+  enable_top_n_per_bucket: true
+  top_n:
+    large_cap: 5
+    mid_cap:   5
+    low_cap:   5
+    new:       5
+  new_token_age_minutes: 180          # tokens younger than this go to "New"
+  prefer_birdeye_present: true        # slight bias when tie-breaking
+
+# -------- Trading (global clamps & behavior) --------
+trading:
+  dry_run: true
+  min_order_usd: 25.0
+  max_order_usd: 500.0
+  slippage_bps: 100                   # 1.00% slippage
+  allow_shorts: false
+  db_fallback_hours: 1                # shortlist fallback window for GUI display
+
+  # Position/risk hygiene (optional; no-ops if your loop doesn’t read them yet)
+  max_open_positions: 6
+  cooldown_seconds_between_buys: 20
+  max_daily_buys: 200
+
+  # Optional TP/SL logic anchors (leave zeros if handled elsewhere)
+  take_profit_pct: 0.0
+  stop_loss_pct: 0.0
+  trailing_stop_pct: 0.0
+
+# -------- Bot sizing (risk-aware; used by utils.compute_buy_size_usd) --------
+bot:
+  prefer_risk_sizing: true
+  max_risk_pct_of_portfolio: 0.05     # 5% of SOL*USD portfolio
+  buy_percentage: 0.10                # legacy % if risk sizing off/unavailable
+  min_usd_per_buy: 25.0
+  max_order_usd: 500.0
+  per_trade_sol: 0.0                  # 0 = no explicit SOL cap per trade
+
+# -------- Jupiter swap execution --------
+jupiter:
+  base_url: "https://quote-api.jup.ag/v6"
+  execute: true
+  quote_only: false
+  timeout_seconds: 20
+
+# -------- Alerts (Telegram) --------
+alerts:
+  enable: false
+  provider: "telegram"
+  telegram:
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+    notify_on:
+      buy: true
+      sell: true
+      error: true
+      filled: true
+      shortlist_update: false
+
+# -------- Database/Cache --------
+database:
+  token_cache_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+  prune_hours: 168                     # 7 days (used by shortlist persistence helpers)
+
+# -------- GUI (Streamlit) --------
+gui:
+  auto_refresh_seconds: 20
+  discovered_tab:
+    show_top_n_per_bucket: true
+    hide_stables: true
+    show_columns:
+      - name
+      - address
+      - price
+      - liquidity
+      - market_cap
+      - volume_24h
+      - price_change_1h
+      - price_change_6h
+      - price_change_24h
+      - safety
+      - dexscreener_link
+
+# -------- Metrics / Observability --------
+metrics:
+  # If you wire this flag through to metrics_engine, it enables fee proration
+  prorate_fees: false
+
+observability:
+  metrics_enabled: false               # disables in-process metrics server
+  metrics_port: 9000
+  prometheus_exporter_enabled: false   # disables Prometheus exporter
+  structured_logs_enabled: false       # plain logs only (no JSON structuring)
+
+# -------- Weights (legacy — some UIs/older scorers still read these) --------
+weights:
+  market_cap: 0.15
+  liquidity: 0.15
+  volume: 0.20
+  price_change: 0.40
+  new_token_bonus: 0.10
+
+# -------- Legacy Back-Compat (aliases older code may still read) --------
+legacy:
+  # Some old builds read these at top-level or in different sections.
+  birdeye_enable_env: "BIRDEYE_ENABLE"
+  force_disable_birdeye_env: "FORCE_DISABLE_BIRDEYE"
+  rugcheck_jwt_env_legacy: "RUGCHECK_JWT"
+  rugcheck_jwt_env_new:    "RUGCHECK_JWT_TOKEN"
+  # Old GUI flags (harmless if ignored)
+  gui_hide_stables_flag: true
+  show_only_top_five_per_bucket: true

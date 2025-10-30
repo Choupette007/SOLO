@@ -1,0 +1,276 @@
+*** Begin Patch
+*** Update File: solana_trading_bot_bundle/trading_bot/tradingNew2.py
+@@
+ def attach_patterns_if_available(token: dict) -> None:
+@@
+-    try:
+-        if not _patterns_module:
+-            return
+-
+-        # Helper: normalize various input shapes into an OHLC dict-of-lists
+-        def _to_ohlcv_dict(src) -> Optional[Dict[str, list]]:
+-            # If it's already a dict-of-lists with required keys
+-            if isinstance(src, dict):
+-                if all(k in src for k in ("open", "high", "low", "close")):
+-                    return {
+-                        "open": list(src.get("open") or []),
+-                        "high": list(src.get("high") or []),
+-                        "low":  list(src.get("low") or []),
+-                        "close": list(src.get("close") or []),
+-                        "volume": list(src.get("volume") or src.get("vol") or []),
+-                    }
+-                return None
+-
+-            # If it's a pandas DataFrame, convert to dict-of-lists
+-            if _pd and isinstance(src, _pd.DataFrame):
+-                try:
+-                    # Require OHLC columns
+-                    for c in ("open", "high", "low", "close"):
+-                        if c not in src.columns:
+-                            return None
+-                    ohlcv = {
+-                        "open": src["open"].tolist(),
+-                        "high": src["high"].tolist(),
+-                        "low": src["low"].tolist(),
+-                        "close": src["close"].tolist(),
+-                    }
+-                    if "volume" in src.columns:
+-                        ohlcv["volume"] = src["volume"].tolist()
+-                    else:
+-                        ohlcv["volume"] = [0] * len(ohlcv["open"])
+-                    return ohlcv
+-                except Exception:
+-                    return None
+-
+-            # If it's a pandas Series (single column of values) — treat like last-close only (not sufficient)
+-            if _pd and isinstance(src, _pd.Series):
+-                # Not enough to classify patterns with one series; bail
+-                return None
+-
+-            return None
+-
+-        # Prefer an explicit _ohlc_df (DataFrame) or any available OHLC lists/dicts attached by upstream.
+-        ohlcv_src = None
+-        if _pd and isinstance(token.get("_ohlc_df"), _pd.DataFrame):
+-            ohlcv_src = token.get("_ohlc_df")
+-        else:
+-            # possible locations: _ohlc_*, ohlcv, ohlcv_5m, _ohlcv_5m, etc.
+-            candidates = (
+-                token.get("_ohlc_df"),
+-                token.get("_ohlc_5m"),
+-                token.get("ohlcv_5m"),
+-                token.get("_ohlcv") or token.get("ohlcv"),
+-                {
+-                    "open": token.get("_ohlc_open"),
+-                    "high": token.get("_ohlc_high"),
+-                    "low": token.get("_ohlc_low"),
+-                    "close": token.get("_ohlc_close"),
+-                    "volume": token.get("_ohlc_volume") or token.get("_ohlc_vol"),
+-                }
+-            )
+-            for c in candidates:
+-                if c is None:
+-                    continue
+-                ohlcv_src = c
+-                break
+-
+-        if ohlcv_src is None:
+-            return
+-
+-        ohlcv_dict = _to_ohlcv_dict(ohlcv_src)
+-        if ohlcv_dict is None:
+-            return
+-
+-        # Call classifier defensively. The classifier may accept dict-of-lists as expected.
+-        try:
+-            pat_hits = {}
+-            try:
+-                pat_hits = _patterns_module.classify_patterns(ohlcv_dict)
+-            except TypeError:
+-                # Older classifier variants might also accept a DataFrame — try creating DataFrame fallback
+-                if _pd:
+-                    try:
+-                        df_try = _pd.DataFrame({
+-                            "open": ohlcv_dict["open"],
+-                            "high": ohlcv_dict["high"],
+-                            "low": ohlcv_dict["low"],
+-                            "close": ohlcv_dict["close"],
+-                            "volume": ohlcv_dict.get("volume", [0] * len(ohlcv_dict["open"]))
+-                        })
+-                        pat_hits = _patterns_module.classify_patterns(df_try)
+-                    except Exception:
+-                        pat_hits = {}
+-                else:
+-                    pat_hits = {}
+-            except Exception:
+-                pat_hits = {}
+-        except Exception:
+-            pat_hits = {}
+-
+-        # Attach booleans for the last row; handle different return shapes (list, tuple, pandas.Series, scalar)
+-        for name, arr in (pat_hits or {}).items():
+-            try:
+-                if _pd and hasattr(arr, "iloc"):
+-                    # pandas Series-like: use iloc[-1] if possible
+-                    try:
+-                        val = bool(arr.iloc[-1])
+-                    except Exception:
+-                        # as fallback try array-like indexing
+-                        val = bool(arr[-1]) if len(arr) else False
+-                    token[f"pat_{name}_last"] = val
+-                    continue
+-
+-                # list/tuple/numpy arrays
+-                if isinstance(arr, (list, tuple)) or (hasattr(arr, "__len__") and not isinstance(arr, (str, bytes))):
+-                    try:
+-                        token[f"pat_{name}_last"] = bool(arr[-1])
+-                    except Exception:
+-                        token[f"pat_{name}_last"] = False
+-                else:
+-                    # scalar truthiness
+-                    token[f"pat_{name}_last"] = bool(arr)
+-            except Exception:
+-                token[f"pat_{name}_last"] = False
+-
+-        # As requested: also attach Bollinger bands in the same step (best-effort)
+-        try:
+-            _attach_bbands_if_available(token)
+-        except Exception:
+-            # never fail due to BB helper
+-            pass
+-
+-    except Exception:
+-        try:
+-            logger.debug("attach_patterns_if_available failed for %s", token.get("symbol", token.get("address")), exc_info=True)
+-        except Exception:
+-            pass
++    try:
++        if not _patterns_module:
++            return
++
++        # Normalize possible OHLC sources to a dict-of-lists with keys open/high/low/close/volume
++        def _src_to_ohlcv(src) -> Optional[Dict[str, list]]:
++            # already dict-of-lists
++            if isinstance(src, dict):
++                if all(k in src for k in ("open", "high", "low", "close")):
++                    return {
++                        "open": list(src.get("open") or []),
++                        "high": list(src.get("high") or []),
++                        "low": list(src.get("low") or []),
++                        "close": list(src.get("close") or []),
++                        "volume": list(src.get("volume") or src.get("vol") or []),
++                    }
++                return None
++
++            # pandas DataFrame → dict-of-lists
++            if _pd and isinstance(src, _pd.DataFrame):
++                try:
++                    for c in ("open", "high", "low", "close"):
++                        if c not in src.columns:
++                            return None
++                    o = {
++                        "open": src["open"].tolist(),
++                        "high": src["high"].tolist(),
++                        "low": src["low"].tolist(),
++                        "close": src["close"].tolist(),
++                    }
++                    o["volume"] = src["volume"].tolist() if "volume" in src.columns else [0] * len(o["open"])
++                    return o
++                except Exception:
++                    return None
++
++            # If we get a pandas.Series (e.g., close series), it's not sufficient for patterns → bail
++            if _pd and isinstance(src, _pd.Series):
++                return None
++
++            return None
++
++        # Candidate sources (in preference order)
++        candidates = [
++            token.get("_ohlc_df"),
++            token.get("_ohlcv"),
++            token.get("ohlcv"),
++            token.get("_ohlc_5m"),
++            token.get("ohlcv_5m"),
++            token.get("ohlcv_5m"),
++            {
++                "open": token.get("_ohlc_open"),
++                "high": token.get("_ohlc_high"),
++                "low": token.get("_ohlc_low"),
++                "close": token.get("_ohlc_close"),
++                "volume": token.get("_ohlc_volume") or token.get("_ohlc_vol"),
++            }
++        ]
++
++        ohlcv = None
++        for c in candidates:
++            if c is None:
++                continue
++            ohlcv = _src_to_ohlcv(c)
++            if ohlcv:
++                break
++
++        if not ohlcv:
++            return
++
++        # Call classifier defensively (it expects dict-of-lists or DataFrame)
++        try:
++            pat_hits = {}
++            try:
++                pat_hits = _patterns_module.classify_patterns(ohlcv)
++            except Exception:
++                # classifier may accept DataFrame in some variants; try that as a fallback
++                if _pd:
++                    try:
++                        df_try = _pd.DataFrame({
++                            "open": ohlcv["open"],
++                            "high": ohlcv["high"],
++                            "low": ohlcv["low"],
++                            "close": ohlcv["close"],
++                            "volume": ohlcv.get("volume", [0] * len(ohlcv["open"]))
++                        })
++                        pat_hits = _patterns_module.classify_patterns(df_try)
++                    except Exception:
++                        pat_hits = {}
++                else:
++                    pat_hits = {}
++        except Exception:
++            pat_hits = {}
++
++        # Attach boolean last-bar flags. Accept lists, tuples, numpy arrays, pandas Series, scalars
++        for name, arr in (pat_hits or {}).items():
++            try:
++                # pandas Series-like
++                if _pd and hasattr(arr, "iloc"):
++                    try:
++                        token[f"pat_{name}_last"] = bool(arr.iloc[-1])
++                        continue
++                    except Exception:
++                        pass
++
++                # numpy array-like or list/tuple
++                if hasattr(arr, "__len__") and not isinstance(arr, (str, bytes)):
++                    try:
++                        token[f"pat_{name}_last"] = bool(arr[-1])
++                        continue
++                    except Exception:
++                        token[f"pat_{name}_last"] = False
++                        continue
++
++                # scalar fallback
++                token[f"pat_{name}_last"] = bool(arr)
++            except Exception:
++                token[f"pat_{name}_last"] = False
++
++        # Also attach Bollinger Bands in the same step (best-effort)
++        try:
++            _attach_bbands_if_available(token)
++        except Exception:
++            pass
++
++    except Exception:
++        try:
++            logger.debug("attach_patterns_if_available failed for %s", token.get("symbol", token.get("address")), exc_info=True)
++        except Exception:
++            pass
+*** End Patch
