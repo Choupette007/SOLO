@@ -3888,7 +3888,8 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]], cfg: dict
                 # Emit batch coverage metrics
                 try:
                     if METRICS is not None and hasattr(METRICS, "record"):
-                        METRICS.record("signals_batch_coverage", {
+                        METRICS.record({
+                            "type": "signals_batch_coverage",
                             "n_attempted": batch_summary.get("n_attempted", 0),
                             "n_bbands": batch_summary.get("n_bbands", 0),
                             "n_patterns": batch_summary.get("n_patterns", 0),
