@@ -3696,7 +3696,14 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]], cfg: dict
     try:
         # Use provided config or load it
         if cfg is None:
-            cfg = load_config() if callable(load_config) else {}
+            try:
+                cfg = load_config() if callable(load_config) else {}
+            except Exception as _e:
+                try:
+                    logger.warning("Failed to load config in _enrich_shortlist_with_signals: %s", _e)
+                except Exception:
+                    pass
+                cfg = {}
         
         # Compute signals configuration once per call
         _signals_cfg = _signals_cfg_from_config(cfg)
@@ -3878,7 +3885,10 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]], cfg: dict
 
             # Run batch BB + pattern attach for collected candidates (best-effort)
             # Requirement 5: Improve logging around batch attachment with try/except and warnings
-            batch_summary = {"n_attempted": 0, "n_bbands": 0, "n_patterns": 0, "errors": 0}
+            def _default_batch_summary(n_tokens=0):
+                return {"n_attempted": n_tokens, "n_bbands": 0, "n_patterns": 0, "errors": n_tokens if n_tokens > 0 else 0}
+            
+            batch_summary = _default_batch_summary()
             if candidate_for_batch:
                 try:
                     logger.debug("Running batch_attach on %d tokens (bb_window=%d)", len(candidate_for_batch), _bb_window)
@@ -3890,7 +3900,7 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]], cfg: dict
                     except Exception:
                         pass
                     # Construct default batch_summary so downstream metrics code can run
-                    batch_summary = {"n_attempted": len(candidate_for_batch), "n_bbands": 0, "n_patterns": 0, "errors": len(candidate_for_batch)}
+                    batch_summary = _default_batch_summary(len(candidate_for_batch))
                 
                 # Requirement 5: Emit METRICS.record for coverage in a safe try/except
                 try:
