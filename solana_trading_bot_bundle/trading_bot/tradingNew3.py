@@ -693,136 +693,6 @@ def _batch_attach_bbands_and_patterns(tokens: list[dict], *, window: int = 20, s
             pass
         return summary
 
-
-async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # If the import failed (e.g., when running as a script), skip enrichment safely
-    if batch_enrich_tokens_with_signals is None:
-        try:
-            logger.debug("Signals enrichment unavailable: fetching module not importable; proceeding without.")
-        except Exception:
-            pass
-        return tokens
-
-    try:
-        fetcher = _resolve_ohlcv_fetcher()
-        if not fetcher:
-            try:
-                logger.debug("Signals enrichment skipped: no OHLCV fetcher found.")
-            except Exception:
-                pass
-            return tokens
-
-        # Run the batch enrichment implementation (may be package or local)
-        enriched = await batch_enrich_tokens_with_signals(tokens, fetch_ohlcv_func=fetcher, concurrency=8)
-
-        # Safety: if enrichment didn't return a list, fall back to original tokens
-        if not isinstance(enriched, list):
-            return tokens
-
-# --- Prepare per-token lightweight OHLC exposures (memoize frames where possible) ---
-candidate_for_batch: list[dict] = []
-_min_bars = int((_signals_cfg.get("patterns") or {}).get("min_bars", 20))
-_bbands_window = int((_signals_cfg.get("bbands") or {}).get("window", 20))
-_bb_stdev = float((_signals_cfg.get("bbands") or {}).get("stdev", 2.0))
-
-for tok in (enriched or []):
-    try:
-        # prefer any existing structures the batch enricher provided
-        # Normalize to lightweight list fields so the helpers can use them
-        # (do not overwrite if already present)
-        if "_ohlc_close" not in tok or not isinstance(tok.get("_ohlc_close"), (list, tuple)):
-            o5 = tok.get("ohlcv_5m") or tok.get("_ohlcv_5m") or (tok.get("ohlcv") or {}).get("5m") if isinstance(tok.get("ohlcv"), dict) else None
-            if isinstance(o5, dict) and all(k in o5 for k in ("open", "close", "high", "low")):
-                try:
-                    tok.setdefault("_ohlc_open", list(o5.get("open") or []))
-                    tok.setdefault("_ohlc_high", list(o5.get("high") or []))
-                    tok.setdefault("_ohlc_low", list(o5.get("low") or []))
-                    tok.setdefault("_ohlc_close", list(o5.get("close") or []))
-                    tok.setdefault("_ohlc_volume", list(o5.get("volume") or o5.get("vol") or []))
-                except Exception:
-                    pass
-
-        # If no inlined OHLC provided yet, try to fetch/ensure it (bounded) and expose lists
-        if not isinstance(tok.get("_ohlc_close"), (list, tuple)) or not tok.get("_ohlc_close"):
-            try:
-                ohlcv5 = await _ensure_ohlcv5(tok)
-                if ohlcv5:
-                    tok.setdefault("_ohlc_open", list(ohlcv5.get("open") or []))
-                    tok.setdefault("_ohlc_high", list(ohlcv5.get("high") or []))
-                    tok.setdefault("_ohlc_low", list(ohlcv5.get("low") or []))
-                    tok.setdefault("_ohlc_close", list(ohlcv5.get("close") or []))
-                    tok.setdefault("_ohlc_volume", list(ohlcv5.get("volume") or []))
-            except Exception:
-                # best-effort; leave token unchanged on failure
-                pass
-
-        # if lists available and long enough, candidate for batch
-        cl = tok.get("_ohlc_close") or []
-        if not isinstance(cl, (list, tuple)):
-            continue
-
-        # require configured minimum bars for patterns/bbands batch
-        if len(cl) >= _min_bars:
-            # optional: memoize pandas DataFrame if pandas present and not already memoized
-            if "_ohlc_df" not in tok:
-                try:
-                    df = _make_df_from_ohlcv_dict({
-                        "open": tok.get("_ohlc_open") or [],
-                        "high": tok.get("_ohlc_high") or [],
-                        "low": tok.get("_ohlc_low") or [],
-                        "close": tok.get("_ohlc_close") or [],
-                        "volume": tok.get("_ohlc_volume") or []
-                    })
-                    if df is not None:
-                        tok["_ohlc_df"] = df
-                        # stamp the cache with timestamp for TTL invalidation elsewhere
-                        try:
-                            import time as _time
-                            tok["_ohlc_df_ts"] = int(_time.time())
-                        except Exception:
-                            tok["_ohlc_df_ts"] = None
-                except Exception:
-                    pass
-            candidate_for_batch.append(tok)
-        else:
-            # short series: still expose lists but don't add to batch candidates
-            # (you may still want per-token BBs via fallback later)
-            continue
-
-    except Exception:
-        # skip token on any normalization error
-        continue
-
-        # run batch helper (best-effort)
-        try:
-            _batch_attach_bbands_and_patterns(candidate_for_batch, window=int(( (load_config() or {}).get("signals") or {}).get("bbands", {}).get("window", 20) or 20), stdev=2.0, pat_list=None)
-        except Exception:
-            # degrade to per-token attach for tokens not handled
-            pass
-
-        # For tokens not processed (short arrays or earlier fail), fall back to per-token attach
-        for tok in (enriched or []):
-            try:
-                # if patterns already attached, skip
-                if any(k.startswith("pat_") for k in tok.keys()):
-                    continue
-                # otherwise try the robust per-token helper (this will attempt BBs too)
-                try:
-                    attach_patterns_if_available(tok)
-                except Exception:
-                    logger.debug("attach_patterns_if_available failed (fallback) for %s", tok.get("symbol", tok.get("address")), exc_info=True)
-            except Exception:
-                continue
-
-        return enriched
-
-    except Exception as e:
-        try:
-            logger.warning("Signals enrichment failed (continuing without): %s", e)
-        except Exception:
-            pass
-        return tokens
-
 def _record_metric_fill(
     token_addr: str,
     symbol: str,
@@ -2453,7 +2323,7 @@ async def _fetch_live_shortlist_once(
 
     # Enrich, but keep neutral path if it returns empty
     try:
-        enriched = await _enrich_shortlist_with_signals(tokens)
+        enriched = await _enrich_shortlist_with_signals(tokens, cfg=config)
         if enriched:
             tokens = enriched
         else:
@@ -3804,7 +3674,17 @@ def _resolve_ohlcv_fetcher():
         return cand
     return None
 
-async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]], cfg: dict | None = None) -> List[Dict[str, Any]]:
+    """
+    Enrich a list of tokens with signals (BBands, patterns, etc.).
+    
+    Args:
+        tokens: List of token dictionaries to enrich
+        cfg: Optional config dict. If None, will call load_config().
+        
+    Returns:
+        Enriched list of tokens (or original list if enrichment fails)
+    """
     # If the import failed (e.g., when running as a script), skip enrichment safely
     if batch_enrich_tokens_with_signals is None:
         try:
@@ -3814,6 +3694,21 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]]) -> List[D
         return tokens
 
     try:
+        # Use provided config or load it
+        if cfg is None:
+            cfg = load_config() if callable(load_config) else {}
+        
+        # Compute signals configuration once per call
+        _signals_cfg = _signals_cfg_from_config(cfg)
+        signals_enabled = bool(_signals_cfg.get("enabled", True))
+        
+        if not signals_enabled:
+            try:
+                logger.debug("Signals enrichment disabled in config; skipping.")
+            except Exception:
+                pass
+            return tokens
+        
         fetcher = _resolve_ohlcv_fetcher()
         if not fetcher:
             try:
@@ -3829,251 +3724,271 @@ async def _enrich_shortlist_with_signals(tokens: List[Dict[str, Any]]) -> List[D
         if not isinstance(enriched, list):
             return tokens
 
-# --- Pattern classification enrichment (best-effort) -----------------
-if _classify_patterns is not None:
-    try:
-        cfg = load_config() if callable(load_config) else {}
-    except Exception:
-        cfg = {}
-    # Read signals config once for this run
-    _signals_cfg = _signals_cfg_from_config(cfg)
-    signals_enabled = bool((_signals_cfg.get("enabled", True)))
-    patterns_enabled = bool((_signals_cfg.get("patterns") or {}).get("enable", True))
+        # Pattern classification enrichment (best-effort within function scope)
+        patterns_enabled = bool((_signals_cfg.get("patterns") or {}).get("enable", True))
+        
+        if _classify_patterns is not None and patterns_enabled:
+            patterns_cfg = (cfg.get("patterns") or {})
+            pat_list = patterns_cfg.get("list") or [
+                "bullish_engulfing", "bearish_engulfing", "hammer", "shooting_star",
+                "morning_star", "evening_star", "doji", "hanging_man"
+            ]
 
-    if signals_enabled and patterns_enabled:
-        patterns_cfg = (cfg.get("patterns") or {})
-        pat_list = patterns_cfg.get("list") or [
-            "bullish_engulfing", "bearish_engulfing", "hammer", "shooting_star",
-            "morning_star", "evening_star", "doji", "hanging_man"
-        ]
-
-        # helper: obtain 5m OHLCV dict, favoring batch enricher fields, with bounded fetcher
-        async def _ensure_ohlcv5(tok: dict):
-            """
-            Return a 5m OHLCV dict with list values for keys:
-            { "open": [...], "high": [...], "low": [...], "close": [...], "volume": [...] }
-            Prefer already-attached OHLCV from the batch enricher; fallback to fetcher(addr, interval="5m")
-            with a per-request timeout from signals config.
-            """
-            # Common locations batch enricher may use
-            candidates = []
-            try:
-                candidates.append(tok.get("ohlcv_5m"))
-            except Exception:
-                pass
-            try:
-                candidates.append(tok.get("_ohlcv_5m"))
-            except Exception:
-                pass
-            try:
-                ohlcv_container = tok.get("ohlcv")
-                if isinstance(ohlcv_container, dict):
-                    candidates.append(ohlcv_container.get("5m"))
-            except Exception:
-                pass
-
-            for c in candidates:
-                if isinstance(c, dict) and all(k in c for k in ("open", "high", "low", "close")):
-                    return {
-                        "open": list(c.get("open") or []),
-                        "high": list(c.get("high") or []),
-                        "low":  list(c.get("low") or []),
-                        "close": list(c.get("close") or []),
-                        "volume": list(c.get("volume") or []),
-                    }
-
-            # Fallback: use resolved OHLCV fetcher (if available) with timeout
-            addr = tok.get("address") or tok.get("token_address") or tok.get("mint") or (tok.get("baseToken") or {}).get("address")
-            if addr and callable(fetcher):
+            # helper: obtain 5m OHLCV dict, favoring batch enricher fields, with bounded fetcher
+            async def _ensure_ohlcv5(tok: dict):
+                """
+                Return a 5m OHLCV dict with list values for keys:
+                { "open": [...], "high": [...], "low": [...], "close": [...], "volume": [...] }
+                Prefer already-attached OHLCV from the batch enricher; fallback to fetcher(addr, interval="5m")
+                with a per-request timeout from signals config.
+                """
+                # Common locations batch enricher may use
+                candidates = []
                 try:
-                    import asyncio as _asyncio
-                    per_timeout = int(_signals_cfg.get("per_ohlcv_timeout_s", 6))
-                    try:
-                        o = await _asyncio.wait_for(fetcher(addr, interval="5m", limit=200), timeout=per_timeout)
-                    except _asyncio.TimeoutError:
-                        return None
-                    except Exception:
-                        return None
-                    if isinstance(o, dict) and all(k in o for k in ("open", "high", "low", "close")):
-                        return {
-                            "open": list(o.get("open") or []),
-                            "high": list(o.get("high") or []),
-                            "low":  list(o.get("low") or []),
-                            "close": list(o.get("close") or []),
-                            "volume": list(o.get("volume") or []),
-                        }
+                    candidates.append(tok.get("ohlcv_5m"))
                 except Exception:
-                    return None
-            return None
-
-                # --- Prepare per-token lightweight OHLC exposures (memoize frames where possible) ---
-                candidate_for_batch: list[dict] = []
-                _min_bars = int((_signals_cfg.get("patterns") or {}).get("min_bars", 20))
-                _bb_window = int((_signals_cfg.get("bbands") or {}).get("window", 20))
-                _bb_stdev = float((_signals_cfg.get("bbands") or {}).get("stdev", 2.0))
-
-                for tok in (enriched or []):
-                    try:
-                        # Ensure we have 5m OHLCV in list form (prefer existing fields, do not clobber)
-                        try:
-                            ohlcv5 = await _ensure_ohlcv5(tok)
-                        except Exception:
-                            # if _ensure_ohlcv5 fails for this token, skip it gracefully
-                            continue
-                        if not ohlcv5:
-                            continue
-
-                        # Expose lightweight OHLC lists for helpers (non-destructive)
-                        try:
-                            tok.setdefault("_ohlc_open", list(ohlcv5.get("open") or []))
-                            tok.setdefault("_ohlc_high", list(ohlcv5.get("high") or []))
-                            tok.setdefault("_ohlc_low", list(ohlcv5.get("low") or []))
-                            tok.setdefault("_ohlc_close", list(ohlcv5.get("close") or []))
-                            tok.setdefault("_ohlc_volume", list(ohlcv5.get("volume") or []))
-                        except Exception:
-                            # best-effort; leave token unchanged on failure
-                            pass
-
-                        # Determine candidate eligibility using configured minimum bars
-                        cl = tok.get("_ohlc_close") or []
-                        if not isinstance(cl, (list, tuple)):
-                            # nothing to do for this token; still attempt light attach
-                            try:
-                                attach_patterns_if_available(tok)
-                            except Exception:
-                                pass
-                            continue
-
-                        # If we have enough bars, prepare for batch processing (and optionally memoize DF)
-                        if len(cl) >= _min_bars:
-                            # Optionally memoize pandas DataFrame so batch helper can reuse it (safe best-effort)
-                            try:
-                                if "_ohlc_df" not in tok and callable(_make_df_from_ohlcv_dict):
-                                    df_candidate = _make_df_from_ohlcv_dict({
-                                        "open": tok.get("_ohlc_open") or [],
-                                        "high": tok.get("_ohlc_high") or [],
-                                        "low": tok.get("_ohlc_low") or [],
-                                        "close": tok.get("_ohlc_close") or [],
-                                        "volume": tok.get("_ohlc_volume") or []
-                                    })
-                                    if df_candidate is not None:
-                                        tok["_ohlc_df"] = df_candidate
-                                        try:
-                                            import time as _time
-                                            tok["_ohlc_df_ts"] = int(_time.time())
-                                        except Exception:
-                                            tok["_ohlc_df_ts"] = None
-                            except Exception:
-                                # non-fatal memoization error; continue
-                                pass
-
-                            # add to batch candidate list
-                            try:
-                                candidate_for_batch.append(tok)
-                            except Exception:
-                                pass
-
-                        else:
-                            # For short series, still run the lightweight attach helper (may compute BB via fallback)
-                            try:
-                                attach_patterns_if_available(tok)
-                            except Exception:
-                                pass
-
-                    except Exception:
-                        # per-token failure should not stop the loop
-                        continue
-
-                # Run batch BB + pattern attach for collected candidates (best-effort)
+                    pass
                 try:
-                    if candidate_for_batch:
-                        try:
-                            logger.debug("Running batch_attach on %d tokens (bb_window=%d)", len(candidate_for_batch), _bb_window)
-                        except Exception:
-                            pass
-                        _batch_attach_bbands_and_patterns(candidate_for_batch, window=_bb_window, stdev=_bb_stdev, pat_list=pat_list)
+                    candidates.append(tok.get("_ohlcv_5m"))
                 except Exception:
-                    # degrade gracefully; will fall back to per-token helpers below
+                    pass
+                try:
+                    ohlcv_container = tok.get("ohlcv")
+                    if isinstance(ohlcv_container, dict):
+                        candidates.append(ohlcv_container.get("5m"))
+                except Exception:
                     pass
 
-                # Post-batch: ensure every token has pattern flags (fallback per-token where needed)
-                for tok in (enriched or []):
+                for c in candidates:
+                    if isinstance(c, dict) and all(k in c for k in ("open", "high", "low", "close")):
+                        return {
+                            "open": list(c.get("open") or []),
+                            "high": list(c.get("high") or []),
+                            "low":  list(c.get("low") or []),
+                            "close": list(c.get("close") or []),
+                            "volume": list(c.get("volume") or []),
+                        }
+
+                # Fallback: use resolved OHLCV fetcher (if available) with timeout
+                addr = tok.get("address") or tok.get("token_address") or tok.get("mint") or (tok.get("baseToken") or {}).get("address")
+                if addr and callable(fetcher):
                     try:
-                        # If the batch helper already attached pattern flags or bb fields, skip redundant work
-                        has_pat = any(k.startswith("pat_") for k in tok.keys())
-                        if not has_pat:
-                            # Primary: try robust helper (this may attach patterns + BBs)
-                            try:
-                                attach_patterns_if_available(tok)
-                            except Exception:
-                                logger.debug("attach_patterns_if_available failed for %s", tok.get("symbol", tok.get("address")), exc_info=True)
-
-                        # Back-compat / fallback: if still no per-bar pattern booleans, run classifier fallback on ohlcv5
+                        import asyncio as _asyncio
+                        per_timeout = int(_signals_cfg.get("per_ohlcv_timeout_s", 6))
                         try:
-                            # prefer explicit 5m-suffixed fields if other parts of code expect them
-                            has_any_5m = any(k.endswith("_5m") for k in tok.keys() if k.startswith("pat_"))
-                            if not has_any_5m and _classify_patterns is not None:
-                                # attempt to obtain ohlcv5 dict (prefer cached lists)
-                                ohlcv5 = None
-                                try:
-                                    ohlcv5 = {
-                                        "open": list(tok.get("_ohlc_open") or []),
-                                        "high": list(tok.get("_ohlc_high") or []),
-                                        "low": list(tok.get("_ohlc_low") or []),
-                                        "close": list(tok.get("_ohlc_close") or []),
-                                        "volume": list(tok.get("_ohlc_volume") or [])
-                                    }
-                                except Exception:
-                                    ohlcv5 = None
-
-                                if ohlcv5 and isinstance(ohlcv5.get("close"), (list, tuple)) and len(ohlcv5.get("close") or []) >= _min_bars:
-                                    try:
-                                        pat_hits = _classify_patterns(ohlcv5, names=pat_list, params=None)
-                                    except Exception:
-                                        pat_hits = {}
-                                    for name, arr in (pat_hits or {}).items():
-                                        try:
-                                            # set both _5m and _last keys for compatibility
-                                            val = False
-                                            if isinstance(arr, (list, tuple)):
-                                                val = bool(arr[-1]) if arr else False
-                                            else:
-                                                try:
-                                                    if hasattr(arr, "iloc"):
-                                                        val = bool(arr.iloc[-1])
-                                                    else:
-                                                        val = bool(arr[-1])
-                                                except Exception:
-                                                    try:
-                                                        val = bool(list(arr)[-1])
-                                                    except Exception:
-                                                        val = False
-                                            tok[f"pat_{name}_5m"] = bool(val)
-                                            tok[f"pat_{name}_last"] = bool(val)
-                                        except Exception:
-                                            tok[f"pat_{name}_5m"] = False
-                                            tok[f"pat_{name}_last"] = False
+                            o = await _asyncio.wait_for(fetcher(addr, interval="5m", limit=200), timeout=per_timeout)
+                        except _asyncio.TimeoutError:
+                            return None
                         except Exception:
-                            # non-fatal
+                            return None
+                        if isinstance(o, dict) and all(k in o for k in ("open", "high", "low", "close")):
+                            return {
+                                "open": list(o.get("open") or []),
+                                "high": list(o.get("high") or []),
+                                "low":  list(o.get("low") or []),
+                                "close": list(o.get("close") or []),
+                                "volume": list(o.get("volume") or []),
+                            }
+                    except Exception:
+                        return None
+                return None
+
+            # --- Prepare per-token lightweight OHLC exposures (memoize frames where possible) ---
+            candidate_for_batch: list[dict] = []
+            _min_bars = int((_signals_cfg.get("patterns") or {}).get("min_bars", 20))
+            _bb_window = int((_signals_cfg.get("bbands") or {}).get("window", 20))
+            _bb_stdev = float((_signals_cfg.get("bbands") or {}).get("stdev", 2.0))
+
+            for tok in (enriched or []):
+                try:
+                    # Ensure we have 5m OHLCV in list form (prefer existing fields, do not clobber)
+                    try:
+                        ohlcv5 = await _ensure_ohlcv5(tok)
+                    except Exception as _e:
+                        # Add debug log when per-token _ensure_ohlcv5 fails (per requirement 6)
+                        try:
+                            logger.debug("_ensure_ohlcv5 failed for token %s: %s", tok.get("symbol", tok.get("address", "unknown")), _e)
+                        except Exception:
+                            pass
+                        # if _ensure_ohlcv5 fails for this token, skip it gracefully
+                        continue
+                    if not ohlcv5:
+                        continue
+
+                    # Expose lightweight OHLC lists for helpers (non-destructive)
+                    try:
+                        tok.setdefault("_ohlc_open", list(ohlcv5.get("open") or []))
+                        tok.setdefault("_ohlc_high", list(ohlcv5.get("high") or []))
+                        tok.setdefault("_ohlc_low", list(ohlcv5.get("low") or []))
+                        tok.setdefault("_ohlc_close", list(ohlcv5.get("close") or []))
+                        tok.setdefault("_ohlcv_volume", list(ohlcv5.get("volume") or []))
+                    except Exception:
+                        # best-effort; leave token unchanged on failure
+                        pass
+
+                    # Determine candidate eligibility using configured minimum bars
+                    cl = tok.get("_ohlc_close") or []
+                    if not isinstance(cl, (list, tuple)):
+                        # nothing to do for this token; still attempt light attach
+                        try:
+                            attach_patterns_if_available(tok)
+                        except Exception:
+                            pass
+                        continue
+
+                    # If we have enough bars, prepare for batch processing (and optionally memoize DF)
+                    if len(cl) >= _min_bars:
+                        # Optionally memoize pandas DataFrame so batch helper can reuse it (safe best-effort)
+                        try:
+                            if "_ohlc_df" not in tok and callable(_make_df_from_ohlcv_dict):
+                                df_candidate = _make_df_from_ohlcv_dict({
+                                    "open": tok.get("_ohlc_open") or [],
+                                    "high": tok.get("_ohlc_high") or [],
+                                    "low": tok.get("_ohlc_low") or [],
+                                    "close": tok.get("_ohlc_close") or [],
+                                    "volume": tok.get("_ohlc_volume") or []
+                                })
+                                if df_candidate is not None:
+                                    tok["_ohlc_df"] = df_candidate
+                                    try:
+                                        import time as _time
+                                        tok["_ohlc_df_ts"] = int(_time.time())
+                                    except Exception:
+                                        tok["_ohlc_df_ts"] = None
+                        except Exception:
+                            # non-fatal memoization error; continue
                             pass
 
-                        # Composite momentum-friendly flags (conservative defaults)
+                        # add to batch candidate list
                         try:
-                            tok.setdefault("pat_bullish_5m", any(tok.get(k, False) for k in (
-                                "pat_bullish_engulfing_5m", "pat_morning_star_5m", "pat_hammer_5m",
-                                "pat_bullish_engulfing_last", "pat_morning_star_last", "pat_hammer_last"
-                            )))
-                            tok.setdefault("pat_bearish_5m", any(tok.get(k, False) for k in (
-                                "pat_bearish_engulfing_5m", "pat_evening_star_5m", "pat_shooting_star_5m", "pat_hanging_man_5m",
-                                "pat_bearish_engulfing_last", "pat_evening_star_last", "pat_shooting_star_last", "pat_hanging_man_last"
-                            )))
+                            candidate_for_batch.append(tok)
                         except Exception:
-                            tok["pat_bullish_5m"] = tok.get("pat_bullish_5m", False)
-                            tok["pat_bearish_5m"] = tok.get("pat_bearish_5m", False)
+                            pass
 
+                    else:
+                        # For short series, still run the lightweight attach helper (may compute BB via fallback)
+                        try:
+                            attach_patterns_if_available(tok)
+                        except Exception:
+                            pass
+
+                except Exception:
+                    # per-token failure should not stop the loop
+                    continue
+
+            # Run batch BB + pattern attach for collected candidates (best-effort)
+            # Requirement 5: Improve logging around batch attachment with try/except and warnings
+            batch_summary = {"n_attempted": 0, "n_bbands": 0, "n_patterns": 0, "errors": 0}
+            if candidate_for_batch:
+                try:
+                    logger.debug("Running batch_attach on %d tokens (bb_window=%d)", len(candidate_for_batch), _bb_window)
+                    batch_summary = _batch_attach_bbands_and_patterns(candidate_for_batch, window=_bb_window, stdev=_bb_stdev, pat_list=pat_list)
+                except Exception as _batch_err:
+                    # Requirement 5: log warning if batch attach fails
+                    try:
+                        logger.warning("Batch attach failed, falling back to per-token: %s", _batch_err)
                     except Exception:
-                        # Fail per-token quietly so enrichment pipeline remains robust
-                        continue
+                        pass
+                    # Construct default batch_summary so downstream metrics code can run
+                    batch_summary = {"n_attempted": len(candidate_for_batch), "n_bbands": 0, "n_patterns": 0, "errors": len(candidate_for_batch)}
+                
+                # Requirement 5: Emit METRICS.record for coverage in a safe try/except
+                try:
+                    if METRICS is not None and hasattr(METRICS, "record"):
+                        METRICS.record({
+                            "type": "signals_batch_summary",
+                            "n_processed": batch_summary.get("n_attempted", 0),
+                            "n_bbands": batch_summary.get("n_bbands", 0),
+                            "n_patterns": batch_summary.get("n_patterns", 0),
+                            "n_errors": batch_summary.get("errors", 0),
+                            "window": _bb_window,
+                            "stdev": _bb_stdev,
+                        })
+                except Exception as _metrics_err:
+                    try:
+                        logger.debug("Failed to emit metrics for batch signals: %s", _metrics_err)
+                    except Exception:
+                        pass
+
+            # Post-batch: ensure every token has pattern flags (fallback per-token where needed)
+            for tok in (enriched or []):
+                try:
+                    # If the batch helper already attached pattern flags or bb fields, skip redundant work
+                    has_pat = any(k.startswith("pat_") for k in tok.keys())
+                    if not has_pat:
+                        # Primary: try robust helper (this may attach patterns + BBs)
+                        try:
+                            attach_patterns_if_available(tok)
+                        except Exception:
+                            logger.debug("attach_patterns_if_available failed for %s", tok.get("symbol", tok.get("address")), exc_info=True)
+
+                    # Back-compat / fallback: if still no per-bar pattern booleans, run classifier fallback on ohlcv5
+                    try:
+                        # prefer explicit 5m-suffixed fields if other parts of code expect them
+                        has_any_5m = any(k.endswith("_5m") for k in tok.keys() if k.startswith("pat_"))
+                        if not has_any_5m and _classify_patterns is not None:
+                            # attempt to obtain ohlcv5 dict (prefer cached lists)
+                            ohlcv5 = None
+                            try:
+                                ohlcv5 = {
+                                    "open": list(tok.get("_ohlc_open") or []),
+                                    "high": list(tok.get("_ohlc_high") or []),
+                                    "low": list(tok.get("_ohlc_low") or []),
+                                    "close": list(tok.get("_ohlc_close") or []),
+                                    "volume": list(tok.get("_ohlc_volume") or [])
+                                }
+                            except Exception:
+                                ohlcv5 = None
+
+                            if ohlcv5 and isinstance(ohlcv5.get("close"), (list, tuple)) and len(ohlcv5.get("close") or []) >= _min_bars:
+                                try:
+                                    pat_hits = _classify_patterns(ohlcv5, names=pat_list, params=None)
+                                except Exception:
+                                    pat_hits = {}
+                                for name, arr in (pat_hits or {}).items():
+                                    try:
+                                        # set both _5m and _last keys for compatibility
+                                        val = False
+                                        if isinstance(arr, (list, tuple)):
+                                            val = bool(arr[-1]) if arr else False
+                                        else:
+                                            try:
+                                                if hasattr(arr, "iloc"):
+                                                    val = bool(arr.iloc[-1])
+                                                else:
+                                                    val = bool(arr[-1])
+                                            except Exception:
+                                                try:
+                                                    val = bool(list(arr)[-1])
+                                                except Exception:
+                                                    val = False
+                                        tok[f"pat_{name}_5m"] = bool(val)
+                                        tok[f"pat_{name}_last"] = bool(val)
+                                    except Exception:
+                                        tok[f"pat_{name}_5m"] = False
+                                        tok[f"pat_{name}_last"] = False
+                    except Exception:
+                        # non-fatal
+                        pass
+
+                    # Composite momentum-friendly flags (conservative defaults)
+                    try:
+                        tok.setdefault("pat_bullish_5m", any(tok.get(k, False) for k in (
+                            "pat_bullish_engulfing_5m", "pat_morning_star_5m", "pat_hammer_5m",
+                            "pat_bullish_engulfing_last", "pat_morning_star_last", "pat_hammer_last"
+                        )))
+                        tok.setdefault("pat_bearish_5m", any(tok.get(k, False) for k in (
+                            "pat_bearish_engulfing_5m", "pat_evening_star_5m", "pat_shooting_star_5m", "pat_hanging_man_5m",
+                            "pat_bearish_engulfing_last", "pat_evening_star_last", "pat_shooting_star_last", "pat_hanging_man_last"
+                        )))
+                    except Exception:
+                        tok["pat_bullish_5m"] = tok.get("pat_bullish_5m", False)
+                        tok["pat_bearish_5m"] = tok.get("pat_bearish_5m", False)
+
+                except Exception:
+                    # Fail per-token quietly so enrichment pipeline remains robust
+                    continue
+        
         return enriched
 
     except Exception as e:
@@ -5213,7 +5128,7 @@ async def main() -> None:
 
                     if using_db_shortlist:
                         try:
-                            enriched = await _enrich_shortlist_with_signals(eligible_tokens)
+                            enriched = await _enrich_shortlist_with_signals(eligible_tokens, cfg=config)
                             eligible_tokens = enriched or eligible_tokens
                             if not enriched:
                                 for t in eligible_tokens:
@@ -5231,7 +5146,7 @@ async def main() -> None:
                         eligible_tokens = _restore_or_compute_categories(eligible_tokens)
                         eligible_tokens = await select_top_five_per_category(eligible_tokens)
                         try:
-                            enriched = await _enrich_shortlist_with_signals(eligible_tokens)
+                            enriched = await _enrich_shortlist_with_signals(eligible_tokens, cfg=config)
                             if enriched:
                                 eligible_tokens = enriched
                             else:
@@ -5415,7 +5330,7 @@ async def main() -> None:
                                 slippage_bps = _clamp_bps(int((config.get("trading") or {}).get("slippage_bps", 150)))
 
                                 # rank/tilt
-                                enriched = await _enrich_shortlist_with_signals(candidates)
+                                enriched = await _enrich_shortlist_with_signals(candidates, cfg=config)
                                 if enriched:
                                     candidates = enriched
                                 else:
