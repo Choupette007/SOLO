@@ -318,6 +318,26 @@ async def _ensure_core_schema(db: aiosqlite.Connection) -> None:
     if "created_at" not in sl_cols:
         await _exec(db, "ALTER TABLE shortlist_tokens ADD COLUMN created_at INTEGER;")
 
+    # discovered_tokens (raw discovery JSON rows for GUI)
+    await _exec(db, """
+        CREATE TABLE IF NOT EXISTS discovered_tokens (
+            address TEXT PRIMARY KEY,
+            data TEXT,
+            name TEXT,
+            symbol TEXT,
+            price REAL,
+            liquidity REAL,
+            market_cap REAL,
+            v24hUSD REAL,
+            volume_24h REAL,
+            dexscreenerUrl TEXT,
+            dsPairAddress TEXT,
+            links TEXT,
+            created_at INTEGER,
+            creation_timestamp INTEGER
+        );
+    """)
+
     # --- Useful indexes ---
     await _exec(db, "CREATE INDEX IF NOT EXISTS idx_eligible_tokens_timestamp ON eligible_tokens(timestamp);")
     await _exec(db, "CREATE INDEX IF NOT EXISTS idx_eligible_tokens_score ON eligible_tokens(score);")
@@ -356,7 +376,7 @@ async def init_db(conn: Optional[aiosqlite.Connection] = None) -> None:
                 tables = {row[0] async for row in cur}
             expected = {
                 'tokens','blacklist','eligible_tokens','cached_token_data',
-                'cached_creation_time','trade_history','shortlist_tokens'
+                'cached_creation_time','trade_history','shortlist_tokens','discovered_tokens'
             }
             missing = expected - tables
             if missing:
@@ -379,7 +399,7 @@ async def init_db(conn: Optional[aiosqlite.Connection] = None) -> None:
                 tables = {row[0] async for row in cur}
             expected = {
                 'tokens','blacklist','eligible_tokens','cached_token_data',
-                'cached_creation_time','trade_history','shortlist_tokens'
+                'cached_creation_time','trade_history','shortlist_tokens','discovered_tokens'
             }
             missing = expected - tables
             if missing:
@@ -419,7 +439,7 @@ async def load_blacklist() -> Set[str]:
 
 
 async def add_to_blacklist(token_address: str, reason: str) -> None:
-    """Add or update a token in the blacklist."""
+    """Add or update a token in the blacklist.""" 
     try:
         async with _connect() as db:
             await db.execute(
@@ -498,9 +518,9 @@ async def review_blacklist() -> None:
         logger.error(f"Failed to review blacklist: {e}\n{traceback.format_exc()}")
 
 
-# ==========================
+# =========================
 # Creation-time cache helpers
-# ==========================
+# =========================
 async def cache_creation_time(token_address: str, creation_time: Optional[datetime]) -> None:
     """Cache the creation time for a token in the database."""
     try:
@@ -545,6 +565,7 @@ async def get_cached_creation_time(token_address: str) -> Optional[datetime]:
     except Exception as e:
         logger.error(f"Failed to retrieve cached creation time for {token_address}: {e}\n{traceback.format_exc()}")
         return None
+
 
 # ======================
 # Token data cache table
@@ -774,7 +795,7 @@ async def mark_token_sold(
 # ============================
 
 async def prune_old_eligible_tokens(max_age_hours: float = 168) -> None:
-    """Remove eligible_tokens entries older than max_age_hours."""
+    """Remove eligible_tokens entries older than max_age_hours.""" 
     cutoff = int(time.time()) - int(max_age_hours * 3600)
     try:
         async with _connect() as db:
@@ -788,7 +809,7 @@ async def prune_old_eligible_tokens(max_age_hours: float = 168) -> None:
 
 
 async def get_token_trade_status(token_address: str) -> Optional[Dict]:
-    """Retrieve the trade status of a token from the tokens table."""
+    """Retrieve the trade status of a token from the tokens table.""" 
     try:
         async with _connect() as db:
             db.row_factory = aiosqlite.Row
@@ -1024,6 +1045,7 @@ async def list_eligible_tokens(
     except Exception as e:
         logger.error("list_eligible_tokens failed: %s\n%s", e, traceback.format_exc())
         return []
+
 
 # ================
 # Shortlist bridge
@@ -1302,12 +1324,46 @@ async def ensure_shortlist_tokens_schema(db: Optional[aiosqlite.Connection] = No
     await db.commit()
 
 
+# Provide an ensure_discovered_tokens_schema helper for parity with other ensure_* helpers
+async def ensure_discovered_tokens_schema(db: Optional[aiosqlite.Connection] = None) -> None:
+    """
+    Ensure discovered_tokens exists (JSON row storage for raw discovery) and has needed columns.
+    Can be called with an existing connection, or with no args to manage its own.
+    """
+    if db is None:
+        async with _connect() as _db:
+            await ensure_discovered_tokens_schema(_db)
+        return
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS discovered_tokens (
+            address TEXT PRIMARY KEY,
+            data TEXT,
+            name TEXT,
+            symbol TEXT,
+            price REAL,
+            liquidity REAL,
+            market_cap REAL,
+            v24hUSD REAL,
+            volume_24h REAL,
+            dexscreenerUrl TEXT,
+            dsPairAddress TEXT,
+            links TEXT,
+            created_at INTEGER,
+            creation_timestamp INTEGER
+        );
+    """)
+    # No backfill needed currently; commit and return
+    await db.commit()
+
+
 async def upsert_token_row(db: aiosqlite.Connection, table: str, token: Dict) -> None:
     """
     Upsert a single JSON token row into 'table' (address, data, created_at).
     Only allows known tables to avoid dynamic-SQL footguns.
     """
-    if table not in {"shortlist_tokens", "eligible_tokens"}:
+    # Allow discovered_tokens in addition to pre-existing shortlist/eligible
+    if table not in {"shortlist_tokens", "eligible_tokens", "discovered_tokens"}:
         raise ValueError(f"Invalid table name: {table}")
 
     addr = token.get("address")
@@ -1327,6 +1383,7 @@ async def upsert_token_row(db: aiosqlite.Connection, table: str, token: Dict) ->
         "ON CONFLICT(address) DO UPDATE SET data=excluded.data, created_at=excluded.created_at;"
     )
     await db.execute(sql, (addr, payload))
+
 
 async def bulk_upsert_tokens(db: aiosqlite.Connection, table: str, tokens: List[Dict]) -> None:
     """
