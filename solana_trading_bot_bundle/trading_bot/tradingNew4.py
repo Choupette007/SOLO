@@ -316,6 +316,7 @@ def _metrics_snapshot_equity_point(logger: logging.Logger | None = None) -> None
 _patterns_module = None
 _pd = None
 _np = None
+_ind = None
 try:
     import numpy as _np  # type: ignore
 except ImportError:
@@ -333,6 +334,14 @@ except ImportError:
         from solana_trading_bot_bundle.trading_bot import candlestick_patterns as _patterns_module  # type: ignore
     except ImportError:
         _patterns_module = None
+try:
+    # Tolerant import for indicators module (relative first, then packaged, else None)
+    from . import indicators as _ind  # type: ignore
+except ImportError:
+    try:
+        from solana_trading_bot_bundle.trading_bot import indicators as _ind  # type: ignore
+    except ImportError:
+        _ind = None
 
 def attach_patterns_if_available(token: dict) -> None:
     """
@@ -1091,6 +1100,25 @@ def _record_metric_fill(
                         **extra_metadata,
                     }
                 )
+            # Best-effort call to _metrics_on_fill after emitting to METRICS
+            try:
+                _metrics_on_fill(
+                    token_addr=token_addr,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    price_usd=price_usd,
+                    fee_usd=fee_usd,
+                    txid=txid,
+                    simulated=simulated,
+                    source=source,
+                    **extra_metadata,
+                )
+            except Exception:
+                try:
+                    logger.debug("_metrics_on_fill call failed", exc_info=True)
+                except Exception:
+                    pass
             try:
                 logger.debug(
                     "Recorded metric fill: %s %s qty=%.6f price_usd=%.6f simulated=%s",
