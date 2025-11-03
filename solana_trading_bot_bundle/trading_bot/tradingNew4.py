@@ -510,7 +510,8 @@ def _batch_attach_bbands_and_patterns(tokens: list[dict], *, window: int = 20, s
             import pandas as _pd
         except Exception:
             _pd = None
-        # Note: _ind is now resolved at module level; no need to re-import here
+        # Note: _ind is now resolved at module level (lines 319-344); no need to re-import here.
+        # This avoids repeated local imports and makes _ind available throughout the module scope.
 
         # If pattern classifier missing and indicators missing, nothing to batch
         if _classify_patterns is None and _ind is None:
@@ -1123,10 +1124,7 @@ def _record_metric_fill(
                     **extra_metadata
                 )
             except Exception:
-                try:
-                    logger.debug("_metrics_on_fill call failed (non-blocking)", exc_info=True)
-                except Exception:
-                    pass
+                logger.debug("_metrics_on_fill call failed (non-blocking)", exc_info=True)
         except Exception:
             # swallow metrics errors
             try:
