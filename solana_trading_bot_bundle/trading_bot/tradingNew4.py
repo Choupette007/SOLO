@@ -316,6 +316,7 @@ def _metrics_snapshot_equity_point(logger: logging.Logger | None = None) -> None
 _patterns_module = None
 _pd = None
 _np = None
+_ind = None
 try:
     import numpy as _np  # type: ignore
 except ImportError:
@@ -333,6 +334,14 @@ except ImportError:
         from solana_trading_bot_bundle.trading_bot import candlestick_patterns as _patterns_module  # type: ignore
     except ImportError:
         _patterns_module = None
+try:
+    # Tolerant indicators module import (local relative -> packaged -> None)
+    from . import indicators as _ind  # type: ignore
+except ImportError:
+    try:
+        from solana_trading_bot_bundle.trading_bot import indicators as _ind  # type: ignore
+    except ImportError:
+        _ind = None
 
 def attach_patterns_if_available(token: dict) -> None:
     """
@@ -501,10 +510,8 @@ def _batch_attach_bbands_and_patterns(tokens: list[dict], *, window: int = 20, s
             import pandas as _pd
         except Exception:
             _pd = None
-        try:
-            from . import indicators as _ind  # pure-Python & vectorized helpers (preferred)
-        except Exception:
-            _ind = None
+        # Note: _ind is now resolved at module level (lines 319-344); no need to re-import here.
+        # This avoids repeated local imports and makes _ind available throughout the module scope.
 
         # If pattern classifier missing and indicators missing, nothing to batch
         if _classify_patterns is None and _ind is None:
@@ -1102,6 +1109,22 @@ def _record_metric_fill(
                 )
             except Exception:
                 pass
+            # Best-effort call to _metrics_on_fill as side-effect after recording to METRICS
+            try:
+                _metrics_on_fill(
+                    token_addr=token_addr,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    price_usd=price_usd,
+                    fee_usd=fee_usd,
+                    txid=txid,
+                    simulated=simulated,
+                    source=source,
+                    **extra_metadata
+                )
+            except Exception:
+                logger.debug("_metrics_on_fill call failed (non-blocking)", exc_info=True)
         except Exception:
             # swallow metrics errors
             try:
