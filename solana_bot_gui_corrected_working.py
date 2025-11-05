@@ -48,6 +48,54 @@ except Exception as _e:
     # logger isn't initialized yet; use print to avoid NameError
     print(f"[package bootstrap] skipped: {_e}", flush=True)
 
+# Safety defaults for app paths and flag files (prevents NameError on import and linter warnings)
+import sys as _sys
+from pathlib import Path
+
+# Ensure APP_DIR exists early (only if not already provided by the script)
+if "APP_DIR" not in globals() or not globals().get("APP_DIR"):
+    if os.name == "nt":
+        _base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or str(Path.home() / "AppData" / "Local")
+        APP_DIR: Path = Path(_base) / "SOLOTradingBot"
+    elif _sys.platform == "darwin":
+        APP_DIR: Path = Path.home() / "Library" / "Application Support" / "SOLOTradingBot"
+    else:
+        APP_DIR: Path = Path.home() / ".local" / "share" / "SOLOTradingBot"
+else:
+    # Coerce existing value to Path
+    try:
+        APP_DIR = Path(globals().get("APP_DIR"))
+    except Exception:
+        APP_DIR = Path.home() / ".local" / "share" / "SOLOTradingBot"
+
+# ensure folder exists (non-fatal)
+try:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+# File defaults (coerce existing values to Path, or set sensible defaults)
+if "STATUS_FILE" not in globals() or not globals().get("STATUS_FILE"):
+    STATUS_FILE: Path = APP_DIR / "rugcheck_status.json"
+else:
+    STATUS_FILE = Path(globals().get("STATUS_FILE"))
+
+if "FAILURES_FILE" not in globals() or not globals().get("FAILURES_FILE"):
+    FAILURES_FILE: Path = APP_DIR / "rugcheck_failures.json"
+else:
+    FAILURES_FILE = Path(globals().get("FAILURES_FILE"))
+
+# Provide STOP_FLAG_PATH and PID_FILE early so other early code can use them safely
+if "STOP_FLAG_PATH" not in globals() or not globals().get("STOP_FLAG_PATH"):
+    STOP_FLAG_PATH: Path = APP_DIR / "bot_stop_flag.txt"
+else:
+    STOP_FLAG_PATH = Path(globals().get("STOP_FLAG_PATH"))
+
+if "PID_FILE" not in globals() or not globals().get("PID_FILE"):
+    PID_FILE: Path = APP_DIR / "bot.pid"
+else:
+    PID_FILE = Path(globals().get("PID_FILE"))
+
 # Insert (or replace) these helper functions near the top of the file,
 # after the imports and before any DataFrame / styler usage.
 
@@ -588,13 +636,54 @@ def _bootstrap_discovery_once() -> None:
         # Force the auto-refresh window to be 'expired' so a pull happens now
         ss["last_token_refresh"] = 0.0
 
-# Coerce status/failures files to Path for safe .exists()/.open() downstream
-from pathlib import Path as _P
+# --- Ensure rugcheck status/failures paths and helper exist -----------------
+# Resolve a sane APP_DIR if one wasn't defined earlier in the module
 try:
-    STATUS_FILE   = _P(STATUS_FILE)
-    FAILURES_FILE = _P(FAILURES_FILE)
+    # If APP_DIR exists and is a Path-like object, coerce to Path; otherwise fall back to a safe per-user folder
+    _APPDIR = Path(APP_DIR) if ("APP_DIR" in globals() and APP_DIR) else (Path.home() / ".local" / "share" / "SOLOTradingBot")
+except Exception:
+    _APPDIR = Path.home() / ".local" / "share" / "SOLOTradingBot"
+
+# Ensure the directory exists (non-fatal)
+try:
+    _APPDIR.mkdir(parents=True, exist_ok=True)
 except Exception:
     pass
+
+# Normalize any preexisting symbolic names to Path; provide defaults if they were not defined
+try:
+    STATUS_FILE = Path(STATUS_FILE)
+except Exception:
+    STATUS_FILE = _APPDIR / "rugcheck_status.json"
+
+try:
+    FAILURES_FILE = Path(FAILURES_FILE)
+except Exception:
+    FAILURES_FILE = _APPDIR / "rugcheck_failures.json"
+
+def ensure_rugcheck_status_file() -> bool:
+    """
+    Create a minimal rugcheck status JSON file if it doesn't already exist.
+    Non-fatal: returns True on success or if file already exists, False on error.
+    """
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not STATUS_FILE.exists():
+            default = {
+                "enabled": False,
+                "available": False,
+                "message": "",
+                "timestamp": int(time.time()),
+            }
+            STATUS_FILE.write_text(json.dumps(default, ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception as _e:
+        # logger may not be configured yet; try to log, otherwise fallback to print
+        try:
+            logger.warning("ensure_rugcheck_status_file failed: %s", _e)
+        except Exception:
+            print("ensure_rugcheck_status_file failed:", _e)
+        return False
 
 # Seed the Rugcheck banner once at app boot (safe no-op if already written)
 try:
@@ -914,39 +1003,37 @@ def start_bot() -> None:
     if _bot_running():
         return  # already running
 
-    # Respect stop flag: if user requested stop, don't start
+    # Respect stop flag: if user requested stop, don't start (only "1" is treated as explicit stop)
     try:
         if STOP_FLAG_PATH.exists():
-            return
+            try:
+                if STOP_FLAG_PATH.read_text(encoding="utf-8").strip() == "1":
+                    return
+            except Exception:
+                # If we can't read it for some reason, be conservative and refuse to start
+                return
     except Exception:
         pass
 
     # clear any previous error since we're attempting a fresh start
     st.session_state.pop("_bot_last_error", None)
 
-    env = os.environ.copy()
+    # Prepare environment for the child process
+    env = dict(os.environ)
     try:
         env["PYTHONPATH"] = _build_pythonpath_for_spawn()
     except Exception:
+        # fallback: keep parent's PYTHONPATH
         pass
-
-    # Decide how to launch the bot (no hard-coded legacy -m target)
-    cmd, label = _resolve_bot_cmd()
-
-    # Build environment for the child so it inherits our loaded .env and PYTHONPATH
-    env = dict(os.environ)
-    # Ensure helpers know where the .env lives (belt-and-suspenders)
     try:
         if "SOLBOT_ENV" not in env and 'ENV_PATH' in globals() and ENV_PATH:
             env["SOLBOT_ENV"] = str(ENV_PATH)
     except Exception:
         pass
-    # Always pass PYTHONPATH we constructed so the child can import the bundle
-    env["PYTHONPATH"] = _build_pythonpath_for_spawn()
 
     # Decide how to launch the bot (no hard-coded legacy -m target)
     cmd, label = _resolve_bot_cmd()
-        
+
     SUBPROC_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(SUBPROC_LOG, "a", encoding="utf-8") as f:
         f.write("\n" + ("=" * 78) + "\n")
@@ -955,47 +1042,91 @@ def start_bot() -> None:
         f.write(f"launcher={label}\n")
         f.write(f"cwd={os.getcwd()}\n")
         try:
-            f.write(f"cmd={_shlex.join(cmd)}\n")
-        except Exception:
-            f.write(f"cmd={cmd}\n")
-        f.flush()
-        try:
-            proc = subprocess.Popen(
-                cmd, env=env, stdout=f, stderr=subprocess.STDOUT, text=True,
-            )
-            # >>> Make the first click “stick”
-            st.session_state["bot_pid"] = int(proc.pid)
-            _write_pidfile(proc.pid)
-            # Clear any autostart locks/flags to avoid fights
-            for k in ("_autostart_done","_autostart_pending","_autostart_error","_autostart_last_try_ts"):
-                st.session_state.pop(k, None)
             try:
-                _release_autostart_lock()
+                f.write(f"cmd={_shlex.join(cmd)}\n")
             except Exception:
-                pass
-            f.write(f"spawned pid={proc.pid}\n"); f.flush()
-        except Exception as e:
-            f.write(f"Spawn failed: {e}\n")
-            st.session_state["_bot_last_error"] = f"Spawn failed: {e}"
-            return
+                f.write(f"cmd={cmd}\n")
+            f.flush()
+
+             # Platform-specific detached spawn so Streamlit reruns won't kill the child
+            if os.name == "nt":
+                # Windows: create hidden process (no console window) + new process group
+                # CREATE_NO_WINDOW prevents a visible console; NEW_PROCESS_GROUP keeps it separate from the GUI.
+                CREATE_NO_WINDOW = 0x08000000
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                creation = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                try:
+                    si = subprocess.STARTUPINFO()
+                    # Ask Windows not to show a window (defensive; may be ignored on some Python builds)
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                except Exception:
+                    si = None
+
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=creation,
+                    close_fds=True,
+                    cwd=os.getcwd(),
+                    text=True,
+                    startupinfo=si if si is not None else None,
+                )
+            else:
+                # POSIX: start in a new session so SIGHUP to the GUI won't kill the child.
+                # Prefer start_new_session=True (Python 3.2+) over preexec_fn=os.setsid.
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                    cwd=os.getcwd(),
+                    text=True,
+                )
 
             pid = int(proc.pid)
             st.session_state["bot_pid"] = pid
             _write_pidfile(pid)
 
+            # Clear any autostart locks/flags to avoid races
+            for k in ("_autostart_done", "_autostart_pending", "_autostart_error", "_autostart_last_try_ts"):
+                st.session_state.pop(k, None)
+            try:
+                _release_autostart_lock()
+            except Exception:
+                pass
+
+            f.write(f"spawned pid={pid}\n")
+            f.flush()
+
             # Detect instant crash and surface the tail to the UI
-            import time as _t
-            _t.sleep(0.9)
+            try:
+                time.sleep(0.8)
+            except Exception:
+                pass
             if not _is_alive(pid):
+                tail = "(no subprocess output available)"
                 try:
-                    tail = "".join(
-                        SUBPROC_LOG.read_text(encoding="utf-8", errors="ignore").splitlines(True)[-120:]
-                    )
-                    st.session_state["_bot_last_error"] = tail
+                    tail = "".join(SUBPROC_LOG.read_text(encoding="utf-8", errors="ignore").splitlines(True)[-200:])
                 except Exception:
-                    st.session_state["_bot_last_error"] = "(failed to read bot_subprocess.log)"
+                    pass
+                st.session_state["_bot_last_error"] = f"Bot exited immediately after spawn. See subprocess log:\n{tail}"
                 _clean_pidfile()
                 st.session_state.pop("bot_pid", None)
+        except Exception as e:
+            # Surface spawn-time exceptions to the subprocess log and the GUI
+            try:
+                f.write(f"Spawn failed: {e}\n")
+                f.flush()
+            except Exception:
+                pass
+            st.session_state["_bot_last_error"] = f"Spawn failed: {e}"
+            return
 
 def stop_bot() -> None:
     """Signal the bot to stop, wait briefly for exit, then force-kill if needed. Cleans all state."""
@@ -1004,17 +1135,18 @@ def stop_bot() -> None:
     # 1) Ask the bot to exit gracefully (your loop should watch this file)
     try:
         STOP_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STOP_FLAG_PATH.write_text("stop\n", encoding="utf-8")
+        # Use canonical "1" so trading.py (which checks for "1") will detect it
+        STOP_FLAG_PATH.write_text("1\n", encoding="utf-8")
     except Exception:
         pass
 
     # 2) Find the PID (prefer session, fall back to pidfile)
     pid = ss.get("bot_pid") or _read_pidfile()
 
-    # 3) Try to terminate the process cleanly; kill if it won't exit
+    # 3) Try to terminate the process cleanly; escalate if it won't exit
     if pid:
         try:
-            import psutil, time
+            import psutil, time as _time, subprocess as _subp
             proc = psutil.Process(int(pid))
             if proc.is_running():
                 try:
@@ -1024,10 +1156,35 @@ def stop_bot() -> None:
                 try:
                     proc.wait(timeout=5)         # give it up to ~5s to honor STOP flag
                 except psutil.TimeoutExpired:
+                    # Terminate children first, then process
+                    try:
+                        for child in proc.children(recursive=True):
+                            try:
+                                child.terminate()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     try:
                         proc.kill()              # force if still alive
                     except Exception:
                         pass
+        except ImportError:
+            # psutil not available — best-effort using taskkill on Windows or kill on POSIX
+            try:
+                if os.name == "nt":
+                    try:
+                        import subprocess as _subp  # ensure subprocess is available here
+                        _subp.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        os.kill(int(pid), 15)  # SIGTERM
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except psutil.NoSuchProcess:
             pass
         except Exception:
@@ -1046,11 +1203,13 @@ def stop_bot() -> None:
         STARTED_AT_FILE.unlink(missing_ok=True)
     except Exception:
         pass
-    try:
-        # optional: remove STOP flag now that we've acted on it
-        STOP_FLAG_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
+
+    # NOTE: keep STOP_FLAG_PATH present so the bot process itself can remove it after a clean shutdown.
+    # If you prefer the GUI to remove the stop flag immediately, uncomment the lines below.
+    # try:
+    #     STOP_FLAG_PATH.unlink(missing_ok=True)
+    # except Exception:
+    #     pass
 
     # 5) Clear session flags so Start is immediately available and autostart can re-run if enabled
     for k in ("bot_pid", "_autostart_done", "_autostart_pending", "_autostart_error", "_autostart_last_try_ts"):
@@ -1061,7 +1220,7 @@ def stop_bot() -> None:
         _release_autostart_lock()
     except Exception:
         pass
-
+    
 # --- Auto-start guard (call once per rerun; respects STOP_FLAG_PATH; double-spawn safe) ---
 AUTO_START_BOT = os.getenv("AUTO_START_BOT", "0").strip().lower() in ("1", "true", "yes", "y")
 _AUTOSTART_BACKOFF_SEC = 2.0
@@ -1090,12 +1249,23 @@ def _maybe_autostart_bot() -> None:
     if ss.get("_autostart_done", False):
         return
 
-    # Respect STOP flag
+    # Respect STOP flag: ONLY treat an explicit "1" as a blocking stop instruction.
+    # If the file exists with any other content we do not treat it as an authoritative stop
+    # (this prevents stale or unrelated contents from permanently blocking autostart).
     try:
         if STOP_FLAG_PATH.exists():
-            ss["_autostart_pending"] = False
-            return
+            try:
+                content = STOP_FLAG_PATH.read_text(encoding="utf-8").strip()
+                if content == "1":
+                    ss["_autostart_pending"] = False
+                    return
+                # If content is present but not "1", ignore and continue with autostart.
+            except Exception:
+                # If we can't read the file, be conservative and don't autostart now.
+                ss["_autostart_pending"] = False
+                return
     except Exception:
+        # If checking .exists() failed for some reason, continue conservatively.
         pass
 
     # Ensure helpers exist
@@ -1110,7 +1280,10 @@ def _maybe_autostart_bot() -> None:
         ss["_autostart_done"] = True
         ss["_autostart_pending"] = False
         ss.pop("_autostart_error", None)
-        _release_autostart_lock()
+        try:
+            _release_autostart_lock()
+        except Exception:
+            pass
         return
 
     # Acquire multi-tab lock; if another tab is handling autostart, skip
@@ -1128,7 +1301,10 @@ def _maybe_autostart_bot() -> None:
             ss["_autostart_done"] = True
             ss["_autostart_pending"] = False
             ss.pop("_autostart_error", None)
-            _release_autostart_lock()
+            try:
+                _release_autostart_lock()
+            except Exception:
+                pass
         else:
             # leave done=False; next rerun will retry after backoff
             ss["_autostart_done"] = False
@@ -1136,7 +1312,10 @@ def _maybe_autostart_bot() -> None:
     except Exception as e:
         ss["_autostart_error"] = str(e)
         ss["_autostart_pending"] = False   # allow manual Start
-        _release_autostart_lock()
+        try:
+            _release_autostart_lock()
+        except Exception:
+            pass
 
 # ... define start_bot / _bot_running first 
 _maybe_autostart_bot()
@@ -1494,10 +1673,18 @@ except Exception:
 # GUI should never migrate env on users
 os.environ.setdefault("SOLANABOT_NO_ENV_MIGRATE", "1")
 
-# Optional: stash for diagnostics
+# Optional: stash for diagnostics (defensive: _env_loaded_from may be absent or not a list)
 try:
-    st.session_state["_env_loaded_from"] = _env_loaded_from
+    _env_loaded_from_val = globals().get("_env_loaded_from", [])
+    # coerce to list for consistent consumption in the UI
+    if not isinstance(_env_loaded_from_val, list):
+        try:
+            _env_loaded_from_val = list(_env_loaded_from_val)
+        except Exception:
+            _env_loaded_from_val = [_env_loaded_from_val]
+    st.session_state["_env_loaded_from"] = _env_loaded_from_val
 except Exception:
+    # keep GUI resilient if session_state isn't writable (rare) or other issues occur
     pass
 
 
@@ -1814,9 +2001,18 @@ except Exception:
         return _os.getenv("RUGCHECK_JWT", "") or _os.getenv("RUGCHECK_API_TOKEN", "")
 
 # Stable/WSOL hide set (fallback if not defined)
-try:
-    _LF_HIDE = set(ALWAYS_HIDE_IN_CATEGORIES)
-except Exception:
+_LF_HIDE = set()
+
+# Prefer an existing ALWAYS_HIDE_IN_CATEGORIES if present, else DEFAULT_ALWAYS_HIDE_IN_CATEGORIES, else literal fallback.
+_src = globals().get("ALWAYS_HIDE_IN_CATEGORIES") or globals().get("DEFAULT_ALWAYS_HIDE_IN_CATEGORIES")
+if _src:
+    try:
+        _LF_HIDE = set(_src)
+    except Exception:
+        _LF_HIDE = set(map(str, _src)) if _src is not None else set()
+
+# Final literal fallback (hard-coded canonical addresses)
+if not _LF_HIDE:
     _LF_HIDE = {
         "So11111111111111111111111111111111111111112",  # WSOL
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
